@@ -89,7 +89,7 @@ class StudioPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self._agent: Optional[ClaudeCodeAgent] = None
-
+        self.max_tool_turns: int = 30
         # 工作室成员: name → {name, subagent_id, persona_prompt, emoji, created_at}
         self.studio_members: dict[str, dict] = {}
 
@@ -119,6 +119,7 @@ class StudioPlugin(Star):
 
         model = self.config.get("model", "claude-3-7-sonnet-20250219")
         base_url = self.config.get("base_url", "").strip() or None
+        self.max_tool_turns = self.config.get("max_tool_turns", 30)
 
         try:
             self._agent = ClaudeCodeAgent(
@@ -126,6 +127,7 @@ class StudioPlugin(Star):
                 claude_api_key=api_key or None,
                 model=model,
                 base_url=base_url,
+                max_turns=self.max_tool_turns,
             )
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] Agent 初始化失败: {e}")
@@ -546,20 +548,28 @@ class StudioPlugin(Star):
                     f"任务={current_task[:60]}"
                 )
 
-                # ---- 发送轮次开始通知 ----
+                # ---- 发送轮次开始通知（带超时保护） ----
                 try:
                     if round_num > 1:
                         prev = conv["turns"][-1] if conv["turns"] else None
                         prev_name = prev["to_member"] if prev else "?"
-                        await event.send(
-                            f"🔄 第{round_num}轮: "
-                            f"{current_member} 正在接手"
-                            f"（来自 {prev_name} 的委托）..."
+                        await asyncio.wait_for(
+                            event.send(
+                                f"🔄 第{round_num}轮: "
+                                f"{current_member} 正在接手"
+                                f"（来自 {prev_name} 的委托）..."
+                            ),
+                            timeout=5.0,
                         )
                     else:
-                        await event.send(
-                            f"🤖 [{current_member}] 开始处理..."
+                        await asyncio.wait_for(
+                            event.send(
+                                f"🤖 [{current_member}] 开始处理..."
+                            ),
+                            timeout=5.0,
                         )
+                except asyncio.TimeoutError:
+                    logger.debug(f"[{PLUGIN_NAME}] event.send 超时，跳过通知")
                 except Exception:
                     pass
 
@@ -574,7 +584,7 @@ class StudioPlugin(Star):
                     member.get("subagent_id", current_member),
                 )
 
-                # ---- 3) 分段实时 yield 给主人 ----
+                # ---- 3) 分段实时 yield 给主人（带超时保护） ----
                 try:
                     seg_size = self.config.get("response_segment_size", 400)
                     segments = self._split_response(response, seg_size)
@@ -584,7 +594,12 @@ class StudioPlugin(Star):
                             if si == 0
                             else f"  (续{si})"
                         )
-                        await event.send(f"{prefix}:\n{seg}")
+                        await asyncio.wait_for(
+                            event.send(f"{prefix}:\n{seg}"),
+                            timeout=5.0,
+                        )
+                except asyncio.TimeoutError:
+                    logger.debug(f"[{PLUGIN_NAME}] 分段发送超时，跳过")
                 except Exception:
                     pass
 
@@ -598,6 +613,22 @@ class StudioPlugin(Star):
                     "timestamp": time.time(),
                 }
                 conv["turns"].append(turn)
+
+                # ---- 4b) 智能停止检测 ----
+                if self.config.get("auto_stop_on_complete", True):
+                    stop_info = self._check_auto_stop(response)
+                    if stop_info:
+                        conv["status"] = "completed"
+                        try:
+                            await event.send(
+                                f"✅ {stop_info} — 自动结束本轮协作"
+                            )
+                        except Exception:
+                            pass
+                        logger.info(
+                            f"[{PLUGIN_NAME}] 智能停止: {stop_info}"
+                        )
+                        break
 
                 # ---- 5) 检测回复中是否有 @委托 ----
                 delegation = self._detect_delegation(response)
@@ -826,6 +857,41 @@ class StudioPlugin(Star):
         return "\n".join(parts)
 
     # ===================================================================
+    # 智能停止检测
+    # ===================================================================
+
+    # 自动停止关键词（中文优先，英文兜底）
+    _AUTO_STOP_PATTERNS = [
+        # 明确完成声明
+        r"任务完成[。.]?$",
+        r"已完成[。.]?$",
+        r"审查完毕[。.]?$",
+        r"以上是最终结果[。.]?$",
+        r"结论如下[：:].*",
+        r"最终代码如下[：:]",
+        r"完成[。.]$",
+        # 英文兜底
+        r"task complete[.。]?$",
+        r"done[.。]?$",
+        r"finished[.。]?$",
+        r"all done[.。]?$",
+        r"here is the (final | complete) (result | code | solution)[。.]?",
+        r"conclusion[：:]",
+    ]
+
+    def _check_auto_stop(self, text: str) -> Optional[str]:
+        """
+        检测回复末尾是否包含完成声明关键词。
+        返回匹配到的关键词描述，或 None（不停止）。
+        匹配位置: 文本末尾 200 字符内（避免误判中间过程）。
+        """
+        tail = text[-200:] if len(text) > 200 else text
+        for pattern in self._AUTO_STOP_PATTERNS:
+            if re.search(pattern, tail, re.IGNORECASE | re.MULTILINE):
+                return f"检测到完成声明「{pattern}」，自动停止"
+        return None
+
+    # ===================================================================
     # 委托检测
     # ===================================================================
 
@@ -1041,19 +1107,23 @@ class StudioPlugin(Star):
         total = len(self.conversations)
         max_rounds = self.config.get("max_internal_turns", 10)
 
+        auto_stop = (
+            "✅ 开启" if self.config.get("auto_stop_on_complete", True) else "❌ 关闭"
+        )
+
         lines = [
             "🏠 工作室状态",
             "",
-            f"  Agent:      {'✅ 就绪' if agent_ok else '❌ 未初始化'}",
-            f"  API Key:    {'✅ 已配置' if api_ok else '❌ 未配置'}",
-            f"  模型:       {model}",
-            f"  成员数:    {n_members}/{max_members}",
-            f"  协作会话:  {active} 活跃 / {total} 总计",
-            f"  最大轮次:  {max_rounds}",
-            f"  持久化:    "
-            f"{'✅ 开启' if self.config.get('persist_members', True) else '关闭'}",
-            f"  自动审阅:  "
-            f"{'✅ 开启' if self.config.get('auto_review', False) else '关闭'}",
+            f"  Agent:         {'✅ 就绪' if agent_ok else '❌ 未初始化'}",
+            f"  API Key:       {'✅ 已配置' if api_ok else '❌ 未配置'}",
+            f"  模型:          {model}",
+            f"  工具调用轮次:  {self.max_tool_turns}（每轮工具调用的上限）",
+            f"  委托轮次:      {max_rounds}（成员间委托的上限）",
+            f"  智能停止:      {auto_stop}",
+            f"  成员数:       {n_members}/{max_members}",
+            f"  协作会话:     {active} 活跃 / {total} 总计",
+            f"  持久化:       {'✅ 开启' if self.config.get('persist_members', True) else '❌ 关闭'}",
+            f"  自动审阅:     {'✅ 开启' if self.config.get('auto_review', False) else '❌ 关闭'}",
         ]
 
         # 成员列表

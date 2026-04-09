@@ -40,11 +40,28 @@
       "step": 1
     }
   },
+  "max_tool_turns": {
+    "type": "int",
+    "description": "单轮工具调用轮次上限",
+    "hint": "控制每轮 agent.run_task() 中的最大工具调用次数，默认 30 轮",
+    "default": 30,
+    "slider": {
+      "min": 5,
+      "max": 100,
+      "step": 5
+    }
+  },
+  "auto_stop_on_complete": {
+    "type": "bool",
+    "description": "检测到任务完成后自动停止工具调用",
+    "hint": "开启后，当回复包含「任务完成」「已完成」「审查完毕」等关键词时，提前结束本轮工具调用",
+    "default": true
+  },
   "max_internal_turns": {
     "type": "int",
-    "description": "最大内部委托轮次",
+    "description": "成员间最大委托轮次",
     "hint": "成员之间互相 @委托的最大轮数，防止死循环",
-    "default": 8,
+    "default": 10,
     "slider": {
       "min": 1,
       "max": 20,
