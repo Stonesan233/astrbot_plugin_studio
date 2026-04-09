@@ -1,0 +1,77 @@
+{
+  "claude_api_key": {
+    "type": "string",
+    "description": "Claude API 密钥",
+    "hint": "Anthropic API Key，与 cc-astrbot-agent 共享。必填。",
+    "default": ""
+  },
+  "base_url": {
+    "type": "string",
+    "description": "Claude API 端点 URL",
+    "hint": "自定义端点，留空使用默认值",
+    "default": ""
+  },
+  "model": {
+    "type": "string",
+    "description": "工作室使用的模型",
+    "hint": "所有 SubAgent 共享的模型名称",
+    "default": "claude-3-7-sonnet-20250219"
+  },
+  "project_root": {
+    "type": "string",
+    "description": "项目根目录",
+    "hint": "Agent 操作的工作目录，留空使用插件目录",
+    "default": ""
+  },
+  "enable_studio": {
+    "type": "bool",
+    "description": "是否启用工作室功能",
+    "hint": "关闭后所有 /studio 命令将不响应",
+    "default": true
+  },
+  "max_members": {
+    "type": "int",
+    "description": "最大成员数量",
+    "hint": "工作室最多可添加的 SubAgent 成员数",
+    "default": 10,
+    "slider": {
+      "min": 2,
+      "max": 30,
+      "step": 1
+    }
+  },
+  "max_internal_turns": {
+    "type": "int",
+    "description": "最大内部委托轮次",
+    "hint": "成员之间互相 @委托的最大轮数，防止死循环",
+    "default": 8,
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    }
+  },
+  "auto_review": {
+    "type": "bool",
+    "description": "是否自动审阅最终结果",
+    "hint": "开启后，最终输出会由发起成员整理后再呈现",
+    "default": false
+  },
+  "response_max_length": {
+    "type": "int",
+    "description": "回复最大字符数",
+    "hint": "超过此长度的回复会被截断",
+    "default": 3000,
+    "slider": {
+      "min": 500,
+      "max": 8000,
+      "step": 500
+    }
+  },
+  "persist_members": {
+    "type": "bool",
+    "description": "是否持久化成员列表",
+    "hint": "开启后成员列表会保存到文件，重启不丢失",
+    "default": true
+  }
+}

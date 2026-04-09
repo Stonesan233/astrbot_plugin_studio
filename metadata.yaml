@@ -1,0 +1,5 @@
+name: astrbot_plugin_studio
+desc: 动态工作室插件，支持自由添加 SubAgent 成员进行群聊协作
+version: v0.1.0
+author: Stonesan
+repo: https://github.com/Stonesan233/astrbot_plugin_studio
