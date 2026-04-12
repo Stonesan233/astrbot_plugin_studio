@@ -57,6 +57,23 @@
     "hint": "开启后，当回复包含「任务完成」「已完成」「审查完毕」等关键词时，提前结束本轮工具调用",
     "default": true
   },
+  "auto_delegate": {
+    "type": "bool",
+    "description": "自动委托机制",
+    "hint": "开启后，成员完成任务会自动委托给搭档成员。编码完成→自动审查，审查完成→自动修改，形成闭环",
+    "default": true
+  },
+  "auto_delegate_max_rounds": {
+    "type": "int",
+    "description": "最大自动委托次数",
+    "hint": "限制每轮协作中自动委托的最大次数，防止无限循环（不含显式@委托）",
+    "default": 4,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
   "max_internal_turns": {
     "type": "int",
     "description": "成员间最大委托轮次",

@@ -3,7 +3,7 @@ AstrBot 插件：动态工作室 (astrbot_plugin_studio)
 =================================================
 
 支持自由添加 SubAgent 成员的群聊协作工作室。
-依赖 cc-astrbot-agent 作为底层 Coding Agent 引擎。
+依赖 astrbot_plugin_claudecode (YukiRa1n) 作为底层执行引擎。
 
 命令:
   /studio add <名称> <人格提示词>   添加工作室成员
@@ -20,6 +20,13 @@ AstrBot 插件：动态工作室 (astrbot_plugin_studio)
   在 /studio chat 消息中输入 @成员名 即可指定由谁处理。
   成员也可以 @其他成员 进行内部委托，形成多轮协作。
   默认最多 10 轮（可配置），避免死循环。
+
+自动委托 (auto_delegate):
+  当成员完成任务后没有显式 @其他成员 时，
+  自动委托给工作室中的另一成员继续处理。
+  - 编码/修改完成后 → 自动 @审查者 请审查我刚修改的代码
+  - 审查完成后     → 自动 @实现者 请根据我的审查意见修改
+  上下文记忆确保每个成员都知道上一步发生了什么。
 """
 
 from __future__ import annotations
@@ -27,7 +34,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import sys
 import time
 import traceback
 import uuid
@@ -39,38 +45,30 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
-# ---------------------------------------------------------------------------
-# 将 cc-astrbot-agent 的 src 加入 import 路径
-# ---------------------------------------------------------------------------
-_PLUGIN_DIR = Path(__file__).resolve().parent
-_CANDIDATE_NAMES = ["cc-astrbot-agent", "astrbot_plugin_claude_code_custom"]
-for _name in _CANDIDATE_NAMES:
-    _dir = _PLUGIN_DIR.parent / _name
-    _src = _dir / "src"
-    for _p in [str(_src), str(_dir)]:
-        if _p not in sys.path:
-            sys.path.insert(0, _p)
-
-from cc_agent.agent import ClaudeCodeAgent  # noqa: E402
-
 PLUGIN_NAME = "astrbot_plugin_studio"
+PLUGIN_DIR = Path(__file__).resolve().parent
 
 # 持久化文件路径
-_MEMBERS_FILE = _PLUGIN_DIR / "studio_members.json"
+_MEMBERS_FILE = PLUGIN_DIR / "studio_members.json"
 
 # 会话过期时间（秒）
 _SESSION_TTL = 3600
 
-
-# ===========================================================================
-# 检测 @委托的正则
-# [\w\u4e00-\u9fff]+ 匹配中文/英文/数字/下划线组成的名字
-# ===========================================================================
+# 检测 @委托的正则: @成员名 后面可跟可选分隔符和消息
 _DELEGATE_RE = re.compile(
     r"(?im)@(?P<name>[\w\u4e00-\u9fff]+)"
     r"\s*[，,：:：]?\s*"
     r"(?P<msg>.+)$"
 )
+
+# 审查任务关键词
+_REVIEW_KEYWORDS = ["审查", "检查", "评审", "审核", "review", "inspect"]
+
+# 编码/修改任务关键词
+_MODIFY_KEYWORDS = [
+    "修改", "实现", "编写", "开发", "重构", "添加", "修复",
+    "implement", "fix", "refactor", "modify", "create", "write",
+]
 
 
 # ===========================================================================
@@ -82,18 +80,17 @@ class StudioPlugin(Star):
     动态工作室插件
 
     支持自由添加 SubAgent 成员，通过 @mention 进行任务委托。
-    每个成员对应一个 SubAgent persona，通过共享的 ClaudeCodeAgent 执行。
+    底层使用 astrbot_plugin_claudecode 的 ClaudeExecutor 执行任务。
     """
 
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
-        self._agent: Optional[ClaudeCodeAgent] = None
-        self.max_tool_turns: int = 30
+        # claudecode 插件的 ClaudeExecutor 实例（初始化时获取）
+        self._executor = None
         # 工作室成员: name → {name, subagent_id, persona_prompt, emoji, created_at}
         self.studio_members: dict[str, dict] = {}
-
-        # 多轮对话历史: studio_session_id → conversation dict
+        # 多轮对话历史: session_id → conversation dict
         self.conversations: dict[str, dict] = {}
 
     # ===================================================================
@@ -101,55 +98,166 @@ class StudioPlugin(Star):
     # ===================================================================
 
     async def initialize(self):
-        """插件初始化"""
+        """插件初始化：检测并连接 claudecode 插件"""
         if not self.config.get("enable_studio", True):
             logger.info(f"[{PLUGIN_NAME}] 工作室功能已禁用")
             return
 
-        api_key = self.config.get("claude_api_key", "").strip()
-        if not api_key:
-            logger.warning(
-                f"[{PLUGIN_NAME}] 未配置 claude_api_key，"
-                "请在插件设置中填写"
-            )
+        # ---- 方式 1: 通过 AstrBot Context 获取已注册的 claudecode 插件 ----
+        executor = self._find_claudecode_executor()
+        if executor:
+            self._executor = executor
+            logger.info(f"[{PLUGIN_NAME}] 已连接 claudecode 插件 (via Context)")
+        else:
+            # ---- 方式 2: 直接导入 claudecode 包 ----
+            executor = self._import_claudecode_executor()
+            if executor:
+                self._executor = executor
+                logger.info(f"[{PLUGIN_NAME}] 已连接 claudecode 插件 (via import)")
+            else:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 未找到 claudecode 插件，"
+                    "工作室的 chat 功能将不可用。"
+                    "请确保 astrbot_plugin_claudecode 已安装并配置。"
+                )
 
-        project_root = self.config.get("project_root", "").strip()
-        if not project_root:
-            project_root = str(_PLUGIN_DIR)
-
-        model = self.config.get("model", "claude-3-7-sonnet-20250219")
-        base_url = self.config.get("base_url", "").strip() or None
-        self.max_tool_turns = self.config.get("max_tool_turns", 30)
-
-        try:
-            self._agent = ClaudeCodeAgent(
-                project_root=project_root,
-                claude_api_key=api_key or None,
-                model=model,
-                base_url=base_url,
-                max_turns=self.max_tool_turns,
-            )
-        except Exception as e:
-            logger.error(f"[{PLUGIN_NAME}] Agent 初始化失败: {e}")
-            self._agent = None
-            return
-
+        # 加载持久化成员
         if self.config.get("persist_members", True):
             self._load_members()
 
+        auto_delegate = "开启" if self.config.get("auto_delegate", True) else "关闭"
         logger.info(
             f"[{PLUGIN_NAME}] 工作室插件已加载，"
             f"当前 {len(self.studio_members)} 位成员 | "
-            f"model={model} | root={project_root}"
+            f"executor={'✅' if self._executor else '❌'} | "
+            f"自动委托: {auto_delegate}"
         )
 
     async def terminate(self):
         """插件销毁"""
         if self.config.get("persist_members", True):
             self._save_members()
-        self._agent = None
+        self._executor = None
         self.conversations.clear()
         logger.info(f"[{PLUGIN_NAME}] 已卸载")
+
+    # ===================================================================
+    # 检测 claudecode 插件
+    # ===================================================================
+
+    def _find_claudecode_executor(self):
+        """
+        通过 AstrBot Context 查找 claudecode 插件实例，
+        返回其 ClaudeExecutor 对象。
+        """
+        try:
+            # AstrBot 注册的插件可通过 context 获取
+            stars = getattr(self.context, '_stars', None) or {}
+            for star_name, star_instance in stars.items():
+                if "claudecode" in star_name.lower() or "claude_code" in star_name.lower():
+                    executor = getattr(star_instance, 'claude_executor', None)
+                    if executor:
+                        return executor
+        except Exception as e:
+            logger.debug(f"[{PLUGIN_NAME}] Context 查找失败: {e}")
+
+        # 备用：遍历所有已注册 Star
+        try:
+            from astrbot.core.star.star_handler import star_handlers_registry
+            for handler in star_handlers_registry:
+                instance = getattr(handler, 'instance', None)
+                if instance and hasattr(instance, 'claude_executor'):
+                    executor = instance.claude_executor
+                    if executor:
+                        return executor
+        except Exception as e:
+            logger.debug(f"[{PLUGIN_NAME}] star_handlers 查找失败: {e}")
+
+        return None
+
+    def _import_claudecode_executor(self):
+        """
+        直接导入 astrbot_plugin_claudecode 包，
+        构建一个独立的 ClaudeExecutor 实例。
+
+        兼容 v3 (模块化, 含相对导入) 和 v2 (单文件) 两种目录结构。
+        """
+        try:
+            import sys
+            plugin_parent = PLUGIN_DIR.parent
+            cc_plugin_dir = None
+            for candidate in [
+                "astrbot_plugin_claude_code_custom",
+                "astrbot_plugin_claudecode",
+                "astrbot_plugin_claude_code",
+            ]:
+                d = plugin_parent / candidate
+                if d.is_dir():
+                    cc_plugin_dir = d
+                    break
+
+            if not cc_plugin_dir:
+                return None
+
+            pkg_name = cc_plugin_dir.name  # e.g. "astrbot_plugin_claudecode"
+            has_v3 = (cc_plugin_dir / "application" / "executor.py").exists()
+
+            if has_v3:
+                # v3 模块化结构：必须把父目录加入 sys.path，
+                # 使包内的相对导入 (from ..models import ...) 能正确解析
+                parent_str = str(cc_plugin_dir.parent)
+                if parent_str not in sys.path:
+                    sys.path.insert(0, parent_str)
+
+                # 用动态包名导入，兼容重命名后的目录
+                _models = __import__(
+                    f"{pkg_name}.models", fromlist=["ClaudeConfig"]
+                )
+                _config = __import__(
+                    f"{pkg_name}.claude_config", fromlist=["ClaudeConfigManager"]
+                )
+                _executor = __import__(
+                    f"{pkg_name}.application.executor", fromlist=["ClaudeExecutor"]
+                )
+                ClaudeConfig = _models.ClaudeConfig
+                ClaudeConfigManager = _config.ClaudeConfigManager
+                ClaudeExecutor = _executor.ClaudeExecutor
+            else:
+                # v2 单文件结构
+                if str(cc_plugin_dir) not in sys.path:
+                    sys.path.insert(0, str(cc_plugin_dir))
+
+                from claude_config import ClaudeConfigManager
+                from claude_executor import ClaudeExecutor
+                from types import ClaudeConfig
+
+            # 从 studio 自身配置中读取 key/url/model 传给 executor
+            api_key = self.config.get("claude_api_key", "").strip()
+            base_url = self.config.get("base_url", "").strip()
+            model = self.config.get("model", "claude-sonnet-4-20250514")
+
+            project_root = self.config.get("project_root", "").strip()
+            workspace = Path(project_root) if project_root else PLUGIN_DIR / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            cfg = ClaudeConfig(
+                auth_token="",
+                api_key=api_key,
+                api_base_url=base_url,
+                model=model,
+                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
+                permission_mode="dontAsk",
+                max_turns=self.config.get("max_tool_turns", 10),
+                timeout_seconds=1800,
+            )
+            config_mgr = None
+            if ClaudeConfigManager:
+                config_mgr = ClaudeConfigManager(cfg, workspace)
+            return ClaudeExecutor(workspace=workspace, config_manager=config_mgr)
+
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 直接导入 claudecode 失败: {e}")
+            return None
 
     # ===================================================================
     # 成员持久化
@@ -187,20 +295,7 @@ class StudioPlugin(Star):
     async def studio_command(
         self, event: AstrMessageEvent, args: GreedyStr = ""
     ):
-        """
-        /studio 工作室命令
-
-        子命令:
-          add <名称> <提示词>   添加成员
-          remove <名称>         移除成员
-          list                  列出成员
-          info <名称>           查看成员详情
-          status                工作室状态（含成员 + 活跃对话）
-          chat <消息>           发起讨论（支持 @成员名）
-          history               协作历史
-          reset                 重置协作
-          help                  帮助
-        """
+        """/studio 工作室命令入口"""
         if not self.config.get("enable_studio", True):
             yield event.plain_result("工作室功能已禁用。")
             return
@@ -208,15 +303,10 @@ class StudioPlugin(Star):
         raw_args = args.strip()
 
         # 备用参数补全（AstrBot GreedyStr 有时会截断长文本）
-        msg_text = ""
         try:
-            msg_text = (
-                event.message_str
-                if hasattr(event, "message_str")
-                else ""
-            )
+            msg_text = getattr(event, "message_str", "") or ""
         except Exception:
-            pass
+            msg_text = ""
 
         if raw_args and " " not in raw_args and msg_text:
             m = re.search(r'/?studio\s+(.*)', msg_text, re.IGNORECASE)
@@ -297,7 +387,6 @@ class StudioPlugin(Star):
         if name.lower() in {n.lower() for n in self.studio_members}:
             return f"成员「{name}」已存在，请使用其他名称"
 
-        # 生成 subagent_id（用于 agent.run_task 的 persona 参数）
         subagent_id = f"studio_{name.lower().replace(' ', '_')}_{int(time.time())}"
 
         self.studio_members[name] = {
@@ -377,10 +466,7 @@ class StudioPlugin(Star):
                 "使用 /studio add <名称> <人格提示词> 添加第一位成员"
             )
 
-        lines = [
-            f"工作室成员 ({len(self.studio_members)}人):",
-            "",
-        ]
+        lines = [f"工作室成员 ({len(self.studio_members)}人):", ""]
         for i, (name, info) in enumerate(self.studio_members.items(), 1):
             emoji = info.get("emoji", "🤖")
             prompt = info["persona_prompt"]
@@ -403,16 +489,11 @@ class StudioPlugin(Star):
         return None
 
     def _detect_target_member(self, text: str) -> Optional[dict]:
-        """
-        从文本中检测 @成员名，返回成员信息。
-        支持中文名、英文名、大小写不敏感。
-        清理群聊 @bot 前缀后再匹配。
-        """
+        """从文本中检测 @成员名，返回成员信息"""
         # 清理群聊 @botname 前缀
         cleaned = re.sub(r"^@\S+\s*", "", text.strip())
 
         for m_name, info in self.studio_members.items():
-            # 匹配 @成员名（整个词边界，支持中文）
             pattern = re.compile(
                 r"@(" + re.escape(m_name) + r")\b",
                 re.IGNORECASE,
@@ -436,10 +517,7 @@ class StudioPlugin(Star):
     async def _handle_chat(
         self, event: AstrMessageEvent, text: str
     ) -> str:
-        """
-        解析消息中的 @成员名，确定目标 SubAgent，
-        然后调用 _internal_delegate 启动多轮委托循环。
-        """
+        """解析消息中的 @成员名，确定目标 SubAgent，启动多轮委托循环"""
         if not text:
             return (
                 "请输入讨论内容。\n"
@@ -478,7 +556,7 @@ class StudioPlugin(Star):
         )
 
     # ===================================================================
-    # 核心：_internal_delegate — 内部委托循环
+    # 核心：_internal_delegate — 内部委托循环（含自动委托）
     # ===================================================================
 
     async def _internal_delegate(
@@ -490,34 +568,54 @@ class StudioPlugin(Star):
     ) -> str:
         """
         内部委托循环：根据 to_member 找到对应的 SubAgent，
-        调用 agent.run_task(prompt, subagent_id)，
-        将每轮结果实时分段 yield/stream 给主人。
+        通过 claudecode 执行器执行任务，
+        将每轮结果实时分段发给主人。
 
-        支持最多 10 轮（可配置）内部委托。
+        支持最多 N 轮（可配置）内部委托。
         成员之间通过 @成员名 互相委托，形成多轮协作。
-
-        流程:
-          1. 获取 / 创建会话 (self.conversations[session_id])
-          2. 每轮: 构建 prompt → agent.run_task() → 检测 @委托
-          3. 有委托 → 切换目标成员，继续
-          4. 无委托 或达到上限 → 结束，返回最终结果
+        当 auto_delegate 开启时，成员完成任务后自动委托给搭档成员。
         """
         session_id = self._get_studio_session_id(event)
         conv = self._get_or_create_conversation(session_id)
         max_rounds = self.config.get("max_internal_turns", 10)
         resp_max_len = self.config.get("response_max_length", 3000)
+        auto_delegate_enabled = self.config.get("auto_delegate", True)
 
-        # 确保 Agent 可用
-        if not self._agent:
-            return "Agent 未就绪，请检查插件配置"
-        if not self._agent.api_key:
-            return "API Key 未配置，请在插件设置中填写"
+        # 确保 executor 可用（惰性重试：claudecode 可能后于 studio 加载）
+        if not self._executor:
+            self._executor = (
+                self._find_claudecode_executor()
+                or self._import_claudecode_executor()
+            )
+        if not self._executor:
+            return (
+                "执行引擎未就绪。\n"
+                "请确保 astrbot_plugin_claudecode 已安装并正确配置。\n"
+                "也可在 studio 插件设置中填写 claude_api_key。"
+            )
 
-        # 重置本轮对话
+        # 重置本轮对话（保留 auto_delegate 上下文追踪字段）
+        preserved_context = {
+            "last_modified_by": conv.get("last_modified_by"),
+            "last_review_by": conv.get("last_review_by"),
+            "last_action_type": conv.get("last_action_type"),
+        }
         conv["turns"] = []
         conv["initial_member"] = to_member
         conv["status"] = "active"
         conv["updated_at"] = time.time()
+        conv["auto_delegate_count"] = 0
+        # 恢复上下文（新对话继承上次的上下文记忆）
+        for k, v in preserved_context.items():
+            if v is not None:
+                conv[k] = v
+
+        # 根据初始任务推断 action type
+        if conv.get("last_action_type") is None:
+            if any(kw in message.lower() for kw in _REVIEW_KEYWORDS):
+                conv["last_action_type"] = "review"
+            else:
+                conv["last_action_type"] = "modification"
 
         start = time.monotonic()
         delegator = from_member
@@ -527,7 +625,8 @@ class StudioPlugin(Star):
         logger.info(
             f"[{PLUGIN_NAME}] _internal_delegate 开始 | "
             f"{delegator} → {current_member} | "
-            f"任务={current_task[:80]}"
+            f"任务={current_task[:80]} | "
+            f"自动委托={'开启' if auto_delegate_enabled else '关闭'}"
         )
 
         try:
@@ -537,18 +636,15 @@ class StudioPlugin(Star):
                 member = self.studio_members.get(current_member)
                 if not member:
                     conv["status"] = "error"
-                    return (
-                        f"成员「{current_member}」已被移除，协作中断"
-                    )
+                    return f"成员「{current_member}」已被移除，协作中断"
 
                 logger.info(
                     f"[{PLUGIN_NAME}] 轮次 {round_num}/{max_rounds} | "
                     f"成员={current_member} | "
-                    f"subagent_id={member.get('subagent_id', current_member)} | "
                     f"任务={current_task[:60]}"
                 )
 
-                # ---- 发送轮次开始通知（带超时保护） ----
+                # ---- 发送轮次开始通知 ----
                 try:
                     if round_num > 1:
                         prev = conv["turns"][-1] if conv["turns"] else None
@@ -573,18 +669,15 @@ class StudioPlugin(Star):
                 except Exception:
                     pass
 
-                # ---- 1) 构建 prompt ----
+                # ---- 1) 构建 prompt（含上下文注入） ----
                 prompt = self._build_prompt(
-                    current_member, member, current_task, conv["turns"]
+                    current_member, member, current_task, conv["turns"], conv
                 )
 
-                # ---- 2) 调用 agent.run_task() 转发给 SubAgent ----
-                response = await self._call_agent(
-                    prompt,
-                    member.get("subagent_id", current_member),
-                )
+                # ---- 2) 调用 claudecode 执行器 ----
+                response = await self._call_executor(prompt)
 
-                # ---- 3) 分段实时 yield 给主人（带超时保护） ----
+                # ---- 3) 分段实时发送 ----
                 try:
                     seg_size = self.config.get("response_segment_size", 400)
                     segments = self._split_response(response, seg_size)
@@ -610,6 +703,7 @@ class StudioPlugin(Star):
                     "message": current_task,
                     "response": response,
                     "delegated_to": None,
+                    "auto_delegated": False,
                     "timestamp": time.time(),
                 }
                 conv["turns"].append(turn)
@@ -625,19 +719,26 @@ class StudioPlugin(Star):
                             )
                         except Exception:
                             pass
-                        logger.info(
-                            f"[{PLUGIN_NAME}] 智能停止: {stop_info}"
-                        )
                         break
 
-                # ---- 5) 检测回复中是否有 @委托 ----
+                # ---- 5) 检测回复中是否有显式 @委托 ----
                 delegation = self._detect_delegation(response)
+
+                # ---- 5b) 自动委托（当无显式 @ 时） ----
+                if not delegation and auto_delegate_enabled:
+                    delegation = self._try_auto_delegate(
+                        current_member, response, conv
+                    )
+                    if delegation:
+                        turn["auto_delegated"] = True
+
                 if delegation:
                     target_name, delegated_msg = delegation
                     turn["delegated_to"] = target_name
 
+                    auto_tag = " (自动)" if turn.get("auto_delegated") else ""
                     logger.info(
-                        f"[{PLUGIN_NAME}] 委托: "
+                        f"[{PLUGIN_NAME}] 委托{auto_tag}: "
                         f"{current_member} → {target_name} | "
                         f"消息={delegated_msg[:60]}"
                     )
@@ -656,14 +757,13 @@ class StudioPlugin(Star):
 
         except asyncio.CancelledError:
             conv["status"] = "error"
-            logger.info(f"[{PLUGIN_NAME}] 协作被取消")
             return "协作被取消。"
 
         except Exception as e:
             conv["status"] = "error"
-            tb = traceback.format_exc()
             logger.error(
-                f"[{PLUGIN_NAME}] _internal_delegate 异常:\n{tb}"
+                f"[{PLUGIN_NAME}] _internal_delegate 异常:\n"
+                f"{traceback.format_exc()}"
             )
             return f"协作异常: {e}"
 
@@ -705,27 +805,180 @@ class StudioPlugin(Star):
         return result
 
     # ===================================================================
-    # Agent 调用
+    # 自动委托机制
     # ===================================================================
 
-    async def _call_agent(self, prompt: str, subagent_id: str) -> str:
+    def _get_auto_delegate_partner(self, current_member: str) -> Optional[str]:
         """
-        调用底层 ClaudeCodeAgent.run_task()。
+        获取自动委托的目标搭档成员。
 
-        subagent_id 作为 persona 参数传入，
-        agent 会用它标记日志，不影响核心逻辑。
+        对于 2 人工作室，返回另一个成员。
+        对于多人工作室，返回列表中的下一个其他成员。
         """
-        if not self._agent:
-            raise RuntimeError("Agent 未初始化")
+        others = [n for n in self.studio_members if n != current_member]
+        return others[0] if others else None
 
-        chunks: list[str] = []
-        async for chunk in self._agent.run_task(
-            task=prompt,
-            persona=subagent_id,
-        ):
-            chunks.append(chunk)
+    def _should_auto_delegate(self, response: str, conv: dict) -> bool:
+        """
+        判断是否应该触发自动委托。
 
-        return "".join(chunks)
+        不触发的情况:
+          - 执行失败
+          - 审查者明确批准（LGTM / 没问题 / 无需修改）
+          - 自动委托次数超过上限
+        """
+        # 执行失败时不自动委托
+        if not response or response.startswith("[执行失败]"):
+            return False
+
+        # 检测批准/通过信号（审查者说"没问题"则不应再委托回去修改）
+        approval_patterns = [
+            # 英文
+            r"(?i)lgtm",
+            r"(?i)approve",
+            r"(?i)looks good",
+            r"(?i)no issues?",
+            r"(?i)ship it",
+            r"(?i)all (tests? )?passed",
+            r"(?i)no (further |additional )?changes? (needed|required)",
+            # 中文 - 明确通过
+            r"全部通过",
+            r"检视.*通过",
+            r"审查.*通过",
+            r"检查.*通过",
+            r"结论.*通过",
+            r"通过[。.]$",
+            r"确认无误",
+            r"修复正确",
+            r"修复确认",
+            r"无需修改",
+            r"无需再做",
+            r"无需.*改动",
+            r"无额外修改",
+            r"没有问题",
+            r"代码.*正确",
+            r"没有发现问题",
+            r"不需要.*修改",
+            r"可以合并",
+            r"可以提交",
+            r"一切正常",
+            r"看起来不错",
+        ]
+        tail = response[-800:] if len(response) > 800 else response
+        for pattern in approval_patterns:
+            if re.search(pattern, tail):
+                logger.info(
+                    f"[{PLUGIN_NAME}] 检测到批准信号，跳过自动委托"
+                )
+                return False
+
+        # 自动委托次数上限（默认最多 4 次自动委托，防止无限循环）
+        max_auto = self.config.get("auto_delegate_max_rounds", 4)
+        if conv.get("auto_delegate_count", 0) >= max_auto:
+            logger.info(
+                f"[{PLUGIN_NAME}] 自动委托已达上限 {max_auto} 次，停止"
+            )
+            return False
+
+        return True
+
+    def _build_auto_delegate_message(
+        self, current_member: str, conv: dict
+    ) -> str:
+        """
+        根据对话上下文构建自动委托的消息。
+
+        逻辑:
+          - 如果当前成员刚完成编码/修改 → 委托审查者审查
+          - 如果当前成员刚完成审查     → 委托实现者根据意见修改
+        """
+        turns = conv.get("turns", [])
+        last_turn = turns[-1] if turns else {}
+        task = last_turn.get("message", "").lower()
+        response_text = last_turn.get("response", "").lower()
+
+        # 判断当前成员完成的任务类型
+        # 优先检查任务描述中的关键词
+        is_review_task = any(kw in task for kw in _REVIEW_KEYWORDS)
+
+        # 如果任务描述不明确，检查回复内容是否像审查意见
+        if not is_review_task:
+            review_response_signals = [
+                "建议", "问题", "需要修改", "应该修改",
+                "改进建议", "发现以下", "需要修复",
+                "issue", "suggestion", "should",
+            ]
+            is_review_task = any(
+                sig in response_text for sig in review_response_signals
+            )
+
+        # 也参考上一次自动委托的类型（交替机制）
+        last_action = conv.get("last_action_type")
+
+        if is_review_task or last_action == "modification":
+            # 当前成员完成了审查 → 委托回去修改
+            conv["last_review_by"] = current_member
+            conv["last_action_type"] = "review"
+            return "请根据我的审查意见修改代码"
+        else:
+            # 当前成员完成了编码 → 委托审查
+            conv["last_modified_by"] = current_member
+            conv["last_action_type"] = "modification"
+            return "请审查我刚修改的代码"
+
+    def _try_auto_delegate(
+        self, current_member: str, response: str, conv: dict
+    ) -> Optional[tuple[str, str]]:
+        """
+        尝试自动委托给搭档成员。
+
+        Returns:
+            (target_name, message) 或 None
+        """
+        # 需要至少 2 个成员才能自动委托
+        partner = self._get_auto_delegate_partner(current_member)
+        if not partner:
+            return None
+
+        # 检查是否应该自动委托
+        if not self._should_auto_delegate(response, conv):
+            return None
+
+        # 构建委托消息
+        msg = self._build_auto_delegate_message(current_member, conv)
+
+        # 更新自动委托计数
+        conv["auto_delegate_count"] = conv.get("auto_delegate_count", 0) + 1
+
+        logger.info(
+            f"[{PLUGIN_NAME}] 自动委托: "
+            f"{current_member} → {partner} | "
+            f"消息={msg}"
+        )
+
+        return (partner, msg)
+
+    # ===================================================================
+    # 调用 claudecode 执行器
+    # ===================================================================
+
+    async def _call_executor(self, prompt: str) -> str:
+        """
+        调用 claudecode 插件的 ClaudeExecutor 执行任务。
+
+        ClaudeExecutor.execute(task) 返回:
+          {"success": bool, "output": str, "error": str, "cost_usd": float}
+        """
+        if not self._executor:
+            raise RuntimeError("ClaudeExecutor 未初始化")
+
+        result = await self._executor.execute(prompt)
+
+        if result.get("success"):
+            return result.get("output", "")
+        else:
+            error = result.get("error", "未知错误")
+            return f"[执行失败] {error}"
 
     # ===================================================================
     # 自动审阅
@@ -760,7 +1013,8 @@ class StudioPlugin(Star):
         ]
 
         for i, turn in enumerate(turns, 1):
-            parts.append(f"第{i}轮 - {turn['to_member']}:")
+            auto_tag = " (自动委托)" if turn.get("auto_delegated") else ""
+            parts.append(f"第{i}轮 - {turn['to_member']}{auto_tag}:")
             parts.append(f"  任务: {turn['message'][:300]}")
             parts.append(f"  回复: {turn['response'][:1000]}")
             parts.append("")
@@ -769,10 +1023,7 @@ class StudioPlugin(Star):
 
         try:
             prompt = "\n".join(parts)
-            reviewed = await self._call_agent(
-                prompt,
-                member.get("subagent_id", reviewer_name),
-            )
+            reviewed = await self._call_executor(prompt)
             if reviewed.strip():
                 logger.info(f"[{PLUGIN_NAME}] 自动审阅完成")
                 return reviewed
@@ -784,7 +1035,7 @@ class StudioPlugin(Star):
         return raw_final
 
     # ===================================================================
-    # Prompt 构建
+    # Prompt 构建（含上下文注入）
     # ===================================================================
 
     def _build_prompt(
@@ -793,11 +1044,14 @@ class StudioPlugin(Star):
         member: dict,
         task: str,
         history: list[dict],
+        conv: dict = None,
     ) -> str:
         """
         构建 SubAgent 的任务提示词。
 
-        结构: [角色设定] + [协作历史] + [当前任务] + [行为指引]
+        结构: [角色设定] + [上下文提示] + [协作历史] + [当前任务] + [行为指引]
+
+        conv 参数用于注入上下文记忆（last_modified_by / last_review_by）。
         """
         parts: list[str] = []
 
@@ -808,6 +1062,29 @@ class StudioPlugin(Star):
             f"{member['persona_prompt']}"
         )
         parts.append("")
+
+        # ---- 上下文注入（基于对话记忆） ----
+        if conv and history:
+            last_modified = conv.get("last_modified_by")
+            last_review = conv.get("last_review_by")
+            last_action = conv.get("last_action_type")
+
+            if last_modified and last_modified != member_name:
+                # 当前成员是审查者，告诉TA谁刚修改了代码
+                parts.append(
+                    f"[上下文提示]\n"
+                    f"{last_modified} 刚刚完成了代码修改，"
+                    f"请重点审查上述变更，检查潜在问题。"
+                )
+                parts.append("")
+            elif last_review and last_review != member_name:
+                # 当前成员是实现者，告诉TA谁审查了代码
+                parts.append(
+                    f"[上下文提示]\n"
+                    f"{last_review} 刚刚完成了代码审查，"
+                    f"请根据上述审查意见进行针对性修改。"
+                )
+                parts.append("")
 
         # ---- 协作历史 ----
         if history:
@@ -820,8 +1097,9 @@ class StudioPlugin(Star):
                 if len(turn["response"]) > 500:
                     resp_prev += "..."
 
+                auto_tag = " (自动)" if turn.get("auto_delegated") else ""
                 parts.append(
-                    f"  {t_name} (来自 {f_name}): {task_prev}"
+                    f"  {t_name} (来自 {f_name}){auto_tag}: {task_prev}"
                 )
                 parts.append(f"    回复摘要: {resp_prev}")
                 if turn.get("delegated_to"):
@@ -844,14 +1122,20 @@ class StudioPlugin(Star):
                 f"\n3. 如需其他成员协助，在回复末尾写「{others_str} 具体要求」。"
             )
 
-        n_directive = "3" if others else "3"
+        auto_delegate_note = ""
+        if self.config.get("auto_delegate", True) and others:
+            auto_delegate_note = (
+                "\n4. 如果你不需要其他成员协助，直接给出最终回复即可，"
+                "系统会自动将结果转发给其他成员。"
+            )
+
         parts.append(
             "[行为指引]\n"
             "1. 完成任务后，直接给出面向主人的最终回复。\n"
             "2. 保持人格风格一致。"
             f"{delegate_hint}\n"
-            f"{n_directive}. "
-            "如果不需要委托，回复中不要包含任何 @。"
+            "3. 如果不需要委托，回复中不要包含任何 @。"
+            f"{auto_delegate_note}"
         )
 
         return "\n".join(parts)
@@ -860,9 +1144,7 @@ class StudioPlugin(Star):
     # 智能停止检测
     # ===================================================================
 
-    # 自动停止关键词（中文优先，英文兜底）
     _AUTO_STOP_PATTERNS = [
-        # 明确完成声明
         r"任务完成[。.]?$",
         r"已完成[。.]?$",
         r"审查完毕[。.]?$",
@@ -870,7 +1152,6 @@ class StudioPlugin(Star):
         r"结论如下[：:].*",
         r"最终代码如下[：:]",
         r"完成[。.]$",
-        # 英文兜底
         r"task complete[.。]?$",
         r"done[.。]?$",
         r"finished[.。]?$",
@@ -880,11 +1161,7 @@ class StudioPlugin(Star):
     ]
 
     def _check_auto_stop(self, text: str) -> Optional[str]:
-        """
-        检测回复末尾是否包含完成声明关键词。
-        返回匹配到的关键词描述，或 None（不停止）。
-        匹配位置: 文本末尾 200 字符内（避免误判中间过程）。
-        """
+        """检测回复末尾是否包含完成声明关键词"""
         tail = text[-200:] if len(text) > 200 else text
         for pattern in self._AUTO_STOP_PATTERNS:
             if re.search(pattern, tail, re.IGNORECASE | re.MULTILINE):
@@ -895,15 +1172,8 @@ class StudioPlugin(Star):
     # 委托检测
     # ===================================================================
 
-    def _detect_delegation(
-        self, text: str
-    ) -> Optional[tuple[str, str]]:
-        """
-        从回复中检测 @成员名 委托。
-
-        返回 (target_member_name, delegated_message) 或 None。
-        取最后一条 @委托（避免中间讨论被误识别）。
-        """
+    def _detect_delegation(self, text: str) -> Optional[tuple[str, str]]:
+        """从回复中检测 @成员名 委托。取最后一条 @委托。"""
         matches = list(_DELEGATE_RE.finditer(text))
         if not matches:
             return None
@@ -912,7 +1182,6 @@ class StudioPlugin(Star):
         name_raw = last.group("name").strip()
         msg = last.group("msg").strip()
 
-        # 查找匹配的成员
         member = self._find_member(name_raw)
         if not member:
             return None
@@ -927,12 +1196,7 @@ class StudioPlugin(Star):
     # ===================================================================
 
     def _get_studio_session_id(self, event: AstrMessageEvent) -> str:
-        """
-        生成工作室会话 ID。
-
-        群聊: unified_msg_origin + sender_id（群内按用户隔离）
-        私聊: unified_msg_origin
-        """
+        """生成工作室会话 ID（群聊按用户隔离）"""
         umo = getattr(event, "unified_msg_origin", None) or ""
         sender = getattr(event, "sender_id", None) or ""
         if sender and "group" in umo.lower():
@@ -940,7 +1204,7 @@ class StudioPlugin(Star):
         return str(umo) if umo else str(uuid.uuid4())
 
     def _get_or_create_conversation(self, session_id: str) -> dict:
-        """获取或创建多轮对话会话"""
+        """获取或创建多轮对话会话（含上下文记忆字段）"""
         if session_id not in self.conversations:
             self.conversations[session_id] = {
                 "id": session_id,
@@ -950,6 +1214,11 @@ class StudioPlugin(Star):
                 "max_rounds": self.config.get("max_internal_turns", 10),
                 "created_at": time.time(),
                 "updated_at": time.time(),
+                # ---- 上下文记忆 ----
+                "last_modified_by": None,   # 最近一次修改代码的成员
+                "last_review_by": None,     # 最近一次审查代码的成员
+                "last_action_type": None,   # 最近一次动作类型: "modification" / "review"
+                "auto_delegate_count": 0,   # 本轮自动委托次数
             }
         return self.conversations[session_id]
 
@@ -972,10 +1241,7 @@ class StudioPlugin(Star):
     def _split_response(
         self, text: str, chunk_size: int = 400
     ) -> list[str]:
-        """
-        将长文本按段落/换行拆分为 ~chunk_size 字一段。
-        优先在换行符处切割，避免截断句子。
-        """
+        """将长文本按段落/换行拆分为 ~chunk_size 字一段"""
         if not text:
             return []
         if len(text) <= chunk_size:
@@ -1011,12 +1277,16 @@ class StudioPlugin(Star):
         initial = conv.get("initial_member", "?")
         parts: list[str] = []
 
+        # 统计自动委托次数
+        auto_count = sum(1 for t in turns if t.get("auto_delegated"))
+
         if len(turns) > 1:
             chain = " → ".join(t["to_member"] for t in turns)
+            auto_info = f" (含 {auto_count} 次自动委托)" if auto_count else ""
             parts.append(
                 f"协作完成 | 发起: {initial} | "
                 f"链路: {chain} | "
-                f"{len(turns)} 轮 | 耗时 {elapsed:.1}s"
+                f"{len(turns)} 轮{auto_info} | 耗时 {elapsed:.1}s"
             )
         else:
             parts.append(f"🤖 {initial} | 耗时 {elapsed:.1}s")
@@ -1027,7 +1297,8 @@ class StudioPlugin(Star):
                 preview = turn["response"][:200]
                 if len(turn["response"]) > 200:
                     preview += "..."
-                parts.append(f"  [{i}] {turn['to_member']}: {preview}")
+                auto_tag = " 🔄自动" if turn.get("auto_delegated") else ""
+                parts.append(f"  [{i}] {turn['to_member']}{auto_tag}: {preview}")
                 if turn.get("delegated_to"):
                     parts.append(
                         f"      ↳ 委托 → {turn['delegated_to']}"
@@ -1040,6 +1311,17 @@ class StudioPlugin(Star):
             parts.append(
                 f"\n⚠️ 达到上限 ({conv['max_rounds']} 轮)，已强制结束。"
             )
+
+        # 上下文记忆摘要
+        last_mod = conv.get("last_modified_by")
+        last_rev = conv.get("last_review_by")
+        if last_mod or last_rev:
+            context_parts = []
+            if last_mod:
+                context_parts.append(f"最近修改: {last_mod}")
+            if last_rev:
+                context_parts.append(f"最近审查: {last_rev}")
+            parts.append(f"\n📋 上下文: {' | '.join(context_parts)}")
 
         return "\n".join(parts)
 
@@ -1066,11 +1348,8 @@ class StudioPlugin(Star):
             )
 
         se = {
-            "active": "🔄",
-            "completed": "✅",
-            "timeout": "⏰",
-            "error": "❌",
-            "idle": "💤",
+            "active": "🔄", "completed": "✅",
+            "timeout": "⏰", "error": "❌", "idle": "💤",
         }.get(conv["status"], "❓")
 
         lines = [
@@ -1078,11 +1357,25 @@ class StudioPlugin(Star):
             f"  发起成员: {conv.get('initial_member', '?')}",
             f"  状态: {conv['status']}",
             f"  轮次: {len(conv['turns'])}/{conv['max_rounds']}",
-            "",
         ]
+
+        # 上下文记忆
+        last_mod = conv.get("last_modified_by")
+        last_rev = conv.get("last_review_by")
+        if last_mod or last_rev:
+            ctx = []
+            if last_mod:
+                ctx.append(f"最近修改: {last_mod}")
+            if last_rev:
+                ctx.append(f"最近审查: {last_rev}")
+            lines.append(f"  上下文: {' | '.join(ctx)}")
+
+        lines.append("")
+
         for i, turn in enumerate(conv["turns"], 1):
+            auto_tag = " 🔄自动" if turn.get("auto_delegated") else ""
             lines.append(
-                f"[{i}] {turn['to_member']} "
+                f"[{i}] {turn['to_member']}{auto_tag} "
                 f"(来自 {turn['from_member']})"
             )
             lines.append(f"    任务: {turn['message'][:150]}")
@@ -1094,10 +1387,8 @@ class StudioPlugin(Star):
         return "\n".join(lines)
 
     def _status_text(self) -> str:
-        """显示工作室状态：Agent + 成员列表 + 活跃对话"""
-        agent_ok = self._agent is not None
-        api_ok = self._agent is not None and bool(self._agent.api_key)
-        model = self._agent.model if self._agent else "未知"
+        """显示工作室状态：引擎 + 成员列表 + 活跃对话"""
+        executor_ok = self._executor is not None
         n_members = len(self.studio_members)
         max_members = self.config.get("max_members", 10)
         active = sum(
@@ -1106,27 +1397,26 @@ class StudioPlugin(Star):
         )
         total = len(self.conversations)
         max_rounds = self.config.get("max_internal_turns", 10)
-
         auto_stop = (
             "✅ 开启" if self.config.get("auto_stop_on_complete", True) else "❌ 关闭"
+        )
+        auto_delegate = (
+            "✅ 开启" if self.config.get("auto_delegate", True) else "❌ 关闭"
         )
 
         lines = [
             "🏠 工作室状态",
             "",
-            f"  Agent:         {'✅ 就绪' if agent_ok else '❌ 未初始化'}",
-            f"  API Key:       {'✅ 已配置' if api_ok else '❌ 未配置'}",
-            f"  模型:          {model}",
-            f"  工具调用轮次:  {self.max_tool_turns}（每轮工具调用的上限）",
-            f"  委托轮次:      {max_rounds}（成员间委托的上限）",
+            f"  执行引擎:     {'✅ claudecode 已连接' if executor_ok else '❌ 未连接'}",
             f"  智能停止:      {auto_stop}",
+            f"  自动委托:      {auto_delegate}",
+            f"  委托轮次上限:  {max_rounds}",
             f"  成员数:       {n_members}/{max_members}",
             f"  协作会话:     {active} 活跃 / {total} 总计",
             f"  持久化:       {'✅ 开启' if self.config.get('persist_members', True) else '❌ 关闭'}",
             f"  自动审阅:     {'✅ 开启' if self.config.get('auto_review', False) else '❌ 关闭'}",
         ]
 
-        # 成员列表
         if n_members > 0:
             lines.extend(["", "── 成员列表 ──"])
             for name, info in self.studio_members.items():
@@ -1134,10 +1424,8 @@ class StudioPlugin(Star):
                 lines.append(f"  {emoji} {name}")
             lines.append("")
 
-        # 活跃对话
         active_convs = [
-            (sid, c)
-            for sid, c in self.conversations.items()
+            (sid, c) for sid, c in self.conversations.items()
             if c["status"] == "active"
         ]
         if active_convs:
@@ -1173,9 +1461,15 @@ class StudioPlugin(Star):
             "  成员之间也可以 @对方 进行内部委托。\n"
             "  默认最多 10 轮（可配置），避免死循环。\n"
             "\n"
+            "自动委托:\n"
+            "  开启后，成员完成任务会自动转发给搭档。\n"
+            "  编码完成 → 自动 @审查者 审查代码\n"
+            "  审查完成 → 自动 @实现者 根据意见修改\n"
+            "  形成「编码→审查→修改→再审查」的闭环。\n"
+            "\n"
             "示例:\n"
             "  /studio add 架构师 你擅长系统设计和架构评审\n"
             "  /studio add 程序员 你擅长 Python 和 Go 编码实现\n"
-            "  /studio chat @架构师 设计一个微服务架构\n"
-            "  /studio chat @程序员 实现用户认证模块"
+            "  /studio chat @程序员 实现用户认证模块\n"
+            "  /studio chat @架构师 设计一个微服务架构"
         )
