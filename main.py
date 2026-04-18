@@ -590,22 +590,13 @@ class StudioPlugin(Star):
                 "也可在 studio 插件设置中填写 claude_api_key。"
             )
 
-        # 重置本轮对话（保留跨对话的上下文追踪字段）
-        preserved_context = {
-            "last_modified_by": conv.get("last_modified_by"),
-            "last_review_by": conv.get("last_review_by"),
-            "modified_files": conv.get("modified_files", []),
-            "last_review_summary": conv.get("last_review_summary"),
-        }
-        conv["turns"] = []
+        # 生成任务 ID，保留历史轮次不清空
+        task_id = str(uuid.uuid4())[:8]
+        conv["current_task_id"] = task_id
         conv["initial_member"] = to_member
         conv["status"] = "active"
         conv["updated_at"] = time.time()
         conv["auto_delegate_count"] = 0
-        # 恢复上下文
-        for k, v in preserved_context.items():
-            if v is not None and v != []:
-                conv[k] = v
 
         start = time.monotonic()
         delegator = from_member
@@ -637,7 +628,8 @@ class StudioPlugin(Star):
                 # ---- 发送轮次开始通知 ----
                 try:
                     if round_num > 1:
-                        prev = conv["turns"][-1] if conv["turns"] else None
+                        current_turns = self._current_task_turns(conv)
+                        prev = current_turns[-1] if current_turns else None
                         prev_name = prev["to_member"] if prev else "?"
                         await asyncio.wait_for(
                             event.send(
@@ -659,9 +651,10 @@ class StudioPlugin(Star):
                 except Exception:
                     pass
 
-                # ---- 1) 构建 prompt（含增强上下文） ----
+                # ---- 1) 构建 prompt（含增强上下文，仅当前任务轮次） ----
+                current_turns = self._current_task_turns(conv)
                 prompt = self._build_prompt(
-                    current_member, member, current_task, conv["turns"], conv
+                    current_member, member, current_task, current_turns, conv
                 )
 
                 # ---- 2) 调用 claudecode 执行器 ----
@@ -702,6 +695,7 @@ class StudioPlugin(Star):
                     and not self._detect_delegation(response)
                 )
                 turn = {
+                    "task_id": task_id,
                     "from_member": delegator,
                     "to_member": current_member,
                     "message": current_task,
@@ -779,18 +773,19 @@ class StudioPlugin(Star):
         elapsed = time.monotonic() - start
 
         # ---- 自动审阅（可选） ----
+        current_turns = self._current_task_turns(conv)
         final_response = (
-            conv["turns"][-1]["response"] if conv["turns"] else ""
+            current_turns[-1]["response"] if current_turns else ""
         )
         if (
             self.config.get("auto_review", False)
             and conv["status"] == "completed"
-            and len(conv["turns"]) > 1
+            and len(current_turns) > 1
         ):
             final_response = await self._auto_review(
                 conv["initial_member"],
                 message,
-                conv["turns"],
+                current_turns,
                 final_response,
             )
 
@@ -1260,6 +1255,13 @@ class StudioPlugin(Star):
                 f"[{PLUGIN_NAME}] 清理 {len(stale)} 个过期会话"
             )
 
+    def _current_task_turns(self, conv: dict) -> list[dict]:
+        """获取当前任务的轮次（按 task_id 过滤）"""
+        task_id = conv.get("current_task_id", "")
+        if not task_id:
+            return conv.get("turns", [])
+        return [t for t in conv.get("turns", []) if t.get("task_id") == task_id]
+
     def _split_response(
         self, text: str, chunk_size: int = 400
     ) -> list[str]:
@@ -1295,7 +1297,7 @@ class StudioPlugin(Star):
         elapsed: float,
     ) -> str:
         """格式化最终呈现给主人的输出"""
-        turns = conv["turns"]
+        turns = self._current_task_turns(conv)
         initial = conv.get("initial_member", "?")
         parts: list[str] = []
 
