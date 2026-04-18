@@ -229,10 +229,40 @@ class StudioPlugin(Star):
             api_key = self.config.get("claude_api_key", "").strip()
             base_url = self.config.get("base_url", "").strip()
             model = self.config.get("model", "claude-sonnet-4-20250514")
+            skip_permissions = self.config.get("dangerously_skip_permissions", False)
+
+            # 尝试从 claude 插件的已保存配置中读取
+            if not api_key or not skip_permissions:
+                try:
+                    import os
+                    claude_cfg_dir = PLUGIN_DIR.parent
+                    for candidate in [
+                        "astrbot_plugin_claude_code_custom",
+                        "astrbot_plugin_claudecode",
+                    ]:
+                        config_json = claude_cfg_dir.parent / "config" / f"{candidate}_config.json"
+                        if config_json.exists():
+                            saved = json.loads(config_json.read_text(encoding="utf-8"))
+                            if not api_key:
+                                api_key = saved.get("api_key", api_key)
+                            if not base_url:
+                                base_url = saved.get("api_base_url", base_url)
+                            if not model or model == "claude-sonnet-4-20250514":
+                                model = saved.get("model", model)
+                            if not skip_permissions:
+                                skip_permissions = saved.get("dangerously_skip_permissions", False)
+                            break
+                except Exception:
+                    pass
 
             project_root = self.config.get("project_root", "").strip()
             workspace = Path(project_root) if project_root else PLUGIN_DIR / "workspace"
             workspace.mkdir(parents=True, exist_ok=True)
+
+            if skip_permissions:
+                permission_mode = None
+            else:
+                permission_mode = "dontAsk"
 
             cfg = ClaudeConfig(
                 auth_token="",
@@ -240,10 +270,17 @@ class StudioPlugin(Star):
                 api_base_url=base_url,
                 model=model,
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
-                permission_mode="dontAsk",
+                permission_mode=permission_mode,
                 max_turns=self.config.get("max_tool_turns", 10),
                 timeout_seconds=1800,
+                dangerously_skip_permissions=skip_permissions,
             )
+
+            if skip_permissions:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 危险权限模式已启用，"
+                    "所有 Bash 和文件操作将无提示执行"
+                )
             config_mgr = None
             if ClaudeConfigManager:
                 config_mgr = ClaudeConfigManager(cfg, workspace)
