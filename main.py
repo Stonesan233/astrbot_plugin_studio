@@ -21,12 +21,10 @@ AstrBot 插件：动态工作室 (astrbot_plugin_studio)
   成员也可以 @其他成员 进行内部委托，形成多轮协作。
   默认最多 10 轮（可配置），避免死循环。
 
-自动委托 (auto_delegate):
-  当成员完成任务后没有显式 @其他成员 时，
-  自动委托给工作室中的另一成员继续处理。
-  - 编码/修改完成后 → 自动 @审查者 请审查我刚修改的代码
-  - 审查完成后     → 自动 @实现者 请根据我的审查意见修改
-  上下文记忆确保每个成员都知道上一步发生了什么。
+LLM 驱动委托:
+  每个成员完成任务后，LLM 自主判断是否需要委托给其他成员。
+  通过在回复末尾使用【委托给X】或【无需委托，任务完成】标记来指示。
+  上下文记忆确保每个成员都知道之前的协作过程。
 """
 
 from __future__ import annotations
@@ -61,14 +59,12 @@ _DELEGATE_RE = re.compile(
     r"(?P<msg>.+)$"
 )
 
-# 审查任务关键词
+# 审查任务关键词（用于上下文判断，不再用于硬编码委托）
 _REVIEW_KEYWORDS = ["审查", "检查", "评审", "审核", "review", "inspect"]
 
-# 编码/修改任务关键词
-_MODIFY_KEYWORDS = [
-    "修改", "实现", "编写", "开发", "重构", "添加", "修复",
-    "implement", "fix", "refactor", "modify", "create", "write",
-]
+# LLM 委托标记正则
+_DELEGATE_MARKER_RE = re.compile(r"【委托给(?P<name>[^】]+)】(?P<msg>[^【]*)")
+_NO_DELEGATE_MARKER_RE = re.compile(r"【无需委托[^】]*】")
 
 
 # ===========================================================================
@@ -79,7 +75,7 @@ class StudioPlugin(Star):
     """
     动态工作室插件
 
-    支持自由添加 SubAgent 成员，通过 @mention 进行任务委托。
+    支持自由添加 SubAgent 成员，通过 @mention 或 LLM 自主判断进行任务委托。
     底层使用 astrbot_plugin_claudecode 的 ClaudeExecutor 执行任务。
     """
 
@@ -125,12 +121,12 @@ class StudioPlugin(Star):
         if self.config.get("persist_members", True):
             self._load_members()
 
-        auto_delegate = "开启" if self.config.get("auto_delegate", True) else "关闭"
+        llm_delegate = "开启" if self.config.get("llm_delegate", True) else "关闭"
         logger.info(
             f"[{PLUGIN_NAME}] 工作室插件已加载，"
             f"当前 {len(self.studio_members)} 位成员 | "
             f"executor={'✅' if self._executor else '❌'} | "
-            f"自动委托: {auto_delegate}"
+            f"LLM 自主委托: {llm_delegate}"
         )
 
     async def terminate(self):
@@ -203,13 +199,11 @@ class StudioPlugin(Star):
             has_v3 = (cc_plugin_dir / "application" / "executor.py").exists()
 
             if has_v3:
-                # v3 模块化结构：必须把父目录加入 sys.path，
-                # 使包内的相对导入 (from ..models import ...) 能正确解析
+                # v3 模块化结构
                 parent_str = str(cc_plugin_dir.parent)
                 if parent_str not in sys.path:
                     sys.path.insert(0, parent_str)
 
-                # 用动态包名导入，兼容重命名后的目录
                 _models = __import__(
                     f"{pkg_name}.models", fromlist=["ClaudeConfig"]
                 )
@@ -556,7 +550,7 @@ class StudioPlugin(Star):
         )
 
     # ===================================================================
-    # 核心：_internal_delegate — 内部委托循环（含自动委托）
+    # 核心：_internal_delegate — LLM 驱动的委托循环
     # ===================================================================
 
     async def _internal_delegate(
@@ -571,17 +565,19 @@ class StudioPlugin(Star):
         通过 claudecode 执行器执行任务，
         将每轮结果实时分段发给主人。
 
-        支持最多 N 轮（可配置）内部委托。
-        成员之间通过 @成员名 互相委托，形成多轮协作。
-        当 auto_delegate 开启时，成员完成任务后自动委托给搭档成员。
+        支持:
+        - 显式 @成员名 委托（成员回复中包含 @other）
+        - LLM 自主判断委托（【委托给X】标记）
+        - 自动检测完成（【无需委托】或无标记时结束）
+        - 增强上下文传递（最近 3 轮、文件变更、审查意见）
         """
         session_id = self._get_studio_session_id(event)
         conv = self._get_or_create_conversation(session_id)
         max_rounds = self.config.get("max_internal_turns", 10)
         resp_max_len = self.config.get("response_max_length", 3000)
-        auto_delegate_enabled = self.config.get("auto_delegate", True)
+        llm_delegate_enabled = self.config.get("llm_delegate", True)
 
-        # 确保 executor 可用（惰性重试：claudecode 可能后于 studio 加载）
+        # 确保 executor 可用（惰性重试）
         if not self._executor:
             self._executor = (
                 self._find_claudecode_executor()
@@ -594,28 +590,22 @@ class StudioPlugin(Star):
                 "也可在 studio 插件设置中填写 claude_api_key。"
             )
 
-        # 重置本轮对话（保留 auto_delegate 上下文追踪字段）
+        # 重置本轮对话（保留跨对话的上下文追踪字段）
         preserved_context = {
             "last_modified_by": conv.get("last_modified_by"),
             "last_review_by": conv.get("last_review_by"),
-            "last_action_type": conv.get("last_action_type"),
+            "modified_files": conv.get("modified_files", []),
+            "last_review_summary": conv.get("last_review_summary"),
         }
         conv["turns"] = []
         conv["initial_member"] = to_member
         conv["status"] = "active"
         conv["updated_at"] = time.time()
         conv["auto_delegate_count"] = 0
-        # 恢复上下文（新对话继承上次的上下文记忆）
+        # 恢复上下文
         for k, v in preserved_context.items():
-            if v is not None:
+            if v is not None and v != []:
                 conv[k] = v
-
-        # 根据初始任务推断 action type
-        if conv.get("last_action_type") is None:
-            if any(kw in message.lower() for kw in _REVIEW_KEYWORDS):
-                conv["last_action_type"] = "review"
-            else:
-                conv["last_action_type"] = "modification"
 
         start = time.monotonic()
         delegator = from_member
@@ -626,7 +616,7 @@ class StudioPlugin(Star):
             f"[{PLUGIN_NAME}] _internal_delegate 开始 | "
             f"{delegator} → {current_member} | "
             f"任务={current_task[:80]} | "
-            f"自动委托={'开启' if auto_delegate_enabled else '关闭'}"
+            f"LLM自主委托={'开启' if llm_delegate_enabled else '关闭'}"
         )
 
         try:
@@ -669,7 +659,7 @@ class StudioPlugin(Star):
                 except Exception:
                     pass
 
-                # ---- 1) 构建 prompt（含上下文注入） ----
+                # ---- 1) 构建 prompt（含增强上下文） ----
                 prompt = self._build_prompt(
                     current_member, member, current_task, conv["turns"], conv
                 )
@@ -677,10 +667,20 @@ class StudioPlugin(Star):
                 # ---- 2) 调用 claudecode 执行器 ----
                 response = await self._call_executor(prompt)
 
-                # ---- 3) 分段实时发送 ----
+                # ---- 3) 解析委托标记（在 strip 之前） ----
+                # 优先级: 显式 @mention > LLM 【委托给...】标记
+                delegation = self._detect_delegation(response)
+
+                if not delegation and llm_delegate_enabled:
+                    delegation = self._parse_llm_delegation(response)
+
+                # 从展示内容中清除委托标记
+                clean_response = self._strip_delegation_markers(response)
+
+                # ---- 4) 分段实时发送 ----
                 try:
                     seg_size = self.config.get("response_segment_size", 400)
-                    segments = self._split_response(response, seg_size)
+                    segments = self._split_response(clean_response, seg_size)
                     for si, seg in enumerate(segments):
                         prefix = (
                             f"🤖 [{current_member}] 第{round_num}轮"
@@ -696,21 +696,30 @@ class StudioPlugin(Star):
                 except Exception:
                     pass
 
-                # ---- 4) 记录轮次到对话历史 ----
+                # ---- 5) 记录轮次到对话历史 ----
+                is_llm_delegated = (
+                    delegation is not None
+                    and not self._detect_delegation(response)
+                )
                 turn = {
                     "from_member": delegator,
                     "to_member": current_member,
                     "message": current_task,
-                    "response": response,
+                    "response": clean_response,
                     "delegated_to": None,
                     "auto_delegated": False,
                     "timestamp": time.time(),
                 }
                 conv["turns"].append(turn)
 
-                # ---- 4b) 智能停止检测 ----
+                # ---- 6) 更新对话级上下文（文件变更、审查追踪） ----
+                self._update_conversation_context(
+                    conv, current_member, current_task, response
+                )
+
+                # ---- 7) 智能停止检测 ----
                 if self.config.get("auto_stop_on_complete", True):
-                    stop_info = self._check_auto_stop(response)
+                    stop_info = self._check_auto_stop(clean_response)
                     if stop_info:
                         conv["status"] = "completed"
                         try:
@@ -721,24 +730,19 @@ class StudioPlugin(Star):
                             pass
                         break
 
-                # ---- 5) 检测回复中是否有显式 @委托 ----
-                delegation = self._detect_delegation(response)
-
-                # ---- 5b) 自动委托（当无显式 @ 时） ----
-                if not delegation and auto_delegate_enabled:
-                    delegation = self._try_auto_delegate(
-                        current_member, response, conv
-                    )
-                    if delegation:
-                        turn["auto_delegated"] = True
-
+                # ---- 8) 处理委托 ----
                 if delegation:
                     target_name, delegated_msg = delegation
                     turn["delegated_to"] = target_name
+                    if is_llm_delegated:
+                        turn["auto_delegated"] = True
+                        conv["auto_delegate_count"] = (
+                            conv.get("auto_delegate_count", 0) + 1
+                        )
 
-                    auto_tag = " (自动)" if turn.get("auto_delegated") else ""
+                    tag = " (LLM自主)" if is_llm_delegated else ""
                     logger.info(
-                        f"[{PLUGIN_NAME}] 委托{auto_tag}: "
+                        f"[{PLUGIN_NAME}] 委托{tag}: "
                         f"{current_member} → {target_name} | "
                         f"消息={delegated_msg[:60]}"
                     )
@@ -747,7 +751,12 @@ class StudioPlugin(Star):
                     current_member = target_name
                     current_task = delegated_msg
                 else:
+                    # 无委托标记 → LLM 判定任务完成，或无 @mention
                     conv["status"] = "completed"
+                    logger.info(
+                        f"[{PLUGIN_NAME}] 无委托指令，协作结束 | "
+                        f"轮次={round_num}"
+                    )
                     break
             else:
                 conv["status"] = "timeout"
@@ -805,158 +814,189 @@ class StudioPlugin(Star):
         return result
 
     # ===================================================================
-    # 自动委托机制
+    # LLM 驱动委托解析
     # ===================================================================
 
-    def _get_auto_delegate_partner(self, current_member: str) -> Optional[str]:
+    def _parse_llm_delegation(self, response: str) -> Optional[tuple[str, str]]:
         """
-        获取自动委托的目标搭档成员。
-
-        对于 2 人工作室，返回另一个成员。
-        对于多人工作室，返回列表中的下一个其他成员。
-        """
-        others = [n for n in self.studio_members if n != current_member]
-        return others[0] if others else None
-
-    def _should_auto_delegate(self, response: str, conv: dict) -> bool:
-        """
-        判断是否应该触发自动委托。
-
-        不触发的情况:
-          - 执行失败
-          - 审查者明确批准（LGTM / 没问题 / 无需修改）
-          - 自动委托次数超过上限
-        """
-        # 执行失败时不自动委托
-        if not response or response.startswith("[执行失败]"):
-            return False
-
-        # 检测批准/通过信号（审查者说"没问题"则不应再委托回去修改）
-        approval_patterns = [
-            # 英文
-            r"(?i)lgtm",
-            r"(?i)approve",
-            r"(?i)looks good",
-            r"(?i)no issues?",
-            r"(?i)ship it",
-            r"(?i)all (tests? )?passed",
-            r"(?i)no (further |additional )?changes? (needed|required)",
-            # 中文 - 明确通过
-            r"全部通过",
-            r"检视.*通过",
-            r"审查.*通过",
-            r"检查.*通过",
-            r"结论.*通过",
-            r"通过[。.]$",
-            r"确认无误",
-            r"修复正确",
-            r"修复确认",
-            r"无需修改",
-            r"无需再做",
-            r"无需.*改动",
-            r"无额外修改",
-            r"没有问题",
-            r"代码.*正确",
-            r"没有发现问题",
-            r"不需要.*修改",
-            r"可以合并",
-            r"可以提交",
-            r"一切正常",
-            r"看起来不错",
-        ]
-        tail = response[-800:] if len(response) > 800 else response
-        for pattern in approval_patterns:
-            if re.search(pattern, tail):
-                logger.info(
-                    f"[{PLUGIN_NAME}] 检测到批准信号，跳过自动委托"
-                )
-                return False
-
-        # 自动委托次数上限（默认最多 4 次自动委托，防止无限循环）
-        max_auto = self.config.get("auto_delegate_max_rounds", 4)
-        if conv.get("auto_delegate_count", 0) >= max_auto:
-            logger.info(
-                f"[{PLUGIN_NAME}] 自动委托已达上限 {max_auto} 次，停止"
-            )
-            return False
-
-        return True
-
-    def _build_auto_delegate_message(
-        self, current_member: str, conv: dict
-    ) -> str:
-        """
-        根据对话上下文构建自动委托的消息。
-
-        逻辑:
-          - 如果当前成员刚完成编码/修改 → 委托审查者审查
-          - 如果当前成员刚完成审查     → 委托实现者根据意见修改
-        """
-        turns = conv.get("turns", [])
-        last_turn = turns[-1] if turns else {}
-        task = last_turn.get("message", "").lower()
-        response_text = last_turn.get("response", "").lower()
-
-        # 判断当前成员完成的任务类型
-        # 优先检查任务描述中的关键词
-        is_review_task = any(kw in task for kw in _REVIEW_KEYWORDS)
-
-        # 如果任务描述不明确，检查回复内容是否像审查意见
-        if not is_review_task:
-            review_response_signals = [
-                "建议", "问题", "需要修改", "应该修改",
-                "改进建议", "发现以下", "需要修复",
-                "issue", "suggestion", "should",
-            ]
-            is_review_task = any(
-                sig in response_text for sig in review_response_signals
-            )
-
-        # 也参考上一次自动委托的类型（交替机制）
-        last_action = conv.get("last_action_type")
-
-        if is_review_task or last_action == "modification":
-            # 当前成员完成了审查 → 委托回去修改
-            conv["last_review_by"] = current_member
-            conv["last_action_type"] = "review"
-            return "请根据我的审查意见修改代码"
-        else:
-            # 当前成员完成了编码 → 委托审查
-            conv["last_modified_by"] = current_member
-            conv["last_action_type"] = "modification"
-            return "请审查我刚修改的代码"
-
-    def _try_auto_delegate(
-        self, current_member: str, response: str, conv: dict
-    ) -> Optional[tuple[str, str]]:
-        """
-        尝试自动委托给搭档成员。
+        从 LLM 回复中解析【委托给X】标记。
 
         Returns:
             (target_name, message) 或 None
         """
-        # 需要至少 2 个成员才能自动委托
-        partner = self._get_auto_delegate_partner(current_member)
-        if not partner:
+        if not response:
             return None
 
-        # 检查是否应该自动委托
-        if not self._should_auto_delegate(response, conv):
+        # 先检查【无需委托...】标记 → 明确不委托
+        if _NO_DELEGATE_MARKER_RE.search(response):
+            logger.info(f"[{PLUGIN_NAME}] LLM 标记【无需委托】，不继续委托")
             return None
 
-        # 构建委托消息
-        msg = self._build_auto_delegate_message(current_member, conv)
+        # 查找【委托给X】标记（取最后一个）
+        matches = list(_DELEGATE_MARKER_RE.finditer(response))
+        if not matches:
+            return None
 
-        # 更新自动委托计数
-        conv["auto_delegate_count"] = conv.get("auto_delegate_count", 0) + 1
+        last = matches[-1]
+        name_raw = last.group("name").strip()
+        msg = last.group("msg").strip()
 
-        logger.info(
-            f"[{PLUGIN_NAME}] 自动委托: "
-            f"{current_member} → {partner} | "
-            f"消息={msg}"
-        )
+        member = self._find_member(name_raw)
+        if not member:
+            logger.info(
+                f"[{PLUGIN_NAME}] LLM 委托目标「{name_raw}」不是工作室成员，忽略"
+            )
+            return None
 
-        return (partner, msg)
+        if not msg:
+            msg = "请协助处理上述任务"
+
+        return (member["name"], msg)
+
+    def _strip_delegation_markers(self, response: str) -> str:
+        """从展示内容中清除委托标记"""
+        cleaned = _DELEGATE_MARKER_RE.sub("", response)
+        cleaned = _NO_DELEGATE_MARKER_RE.sub("", cleaned)
+        return cleaned.strip()
+
+    # ===================================================================
+    # 增强上下文：文件变更提取 & 上下文构建
+    # ===================================================================
+
+    def _extract_file_changes(self, response: str) -> list[str]:
+        """从执行器输出中提取被修改的文件路径"""
+        files: list[str] = []
+        seen: set[str] = set()
+
+        patterns = [
+            # 中文
+            r'(?:编辑|修改|写入|更新|创建|删除)\s*[了：:]\s*[`"\']?([^\s`"\'：:,，()\n]+\.\w+)',
+            r'文件\s*[`"\']([^\s`"\']+\.\w+)[`"\']',
+            # 英文 / Claude Code 风格
+            r'(?:Edit|Write|Modified|Updated?|Creat|Delet)\w*\s*[：:]\s*[`"\']?([^\s`"\'：:,，()\n]+\.\w+)',
+            r'(?:file|path)\s*[`"\']([^\s`"\']+\.\w+)[`"\']',
+            # 反引号包裹的文件路径
+            r'`([^`]+\.[a-zA-Z]\w*)`',
+        ]
+
+        for pattern in patterns:
+            for match in re.finditer(pattern, response, re.IGNORECASE):
+                path = match.group(1).strip().strip("'\"")
+                # 过滤明显的非文件路径
+                if (
+                    "." in path
+                    and len(path) < 200
+                    and not path.startswith("http")
+                    and not path.startswith("(")
+                    and path not in seen
+                ):
+                    seen.add(path)
+                    files.append(path)
+
+        return files[:15]  # 最多 15 个文件
+
+    def _update_conversation_context(
+        self, conv: dict, member_name: str, task: str, raw_response: str
+    ):
+        """每轮结束后更新对话级别的上下文追踪"""
+        # 追踪文件变更
+        files = self._extract_file_changes(raw_response)
+        if files:
+            existing = conv.get("modified_files", [])
+            for f in files:
+                if f not in existing:
+                    existing.append(f)
+            conv["modified_files"] = existing[-30:]  # 最多保留 30 个
+            conv["last_modified_by"] = member_name
+
+        # 追踪审查意见
+        task_lower = task.lower()
+        if any(kw in task_lower for kw in _REVIEW_KEYWORDS):
+            conv["last_review_by"] = member_name
+            # 保留审查意见摘要（原始回复，包含标记）
+            conv["last_review_summary"] = raw_response[:800]
+
+    def _build_rich_context(
+        self, member_name: str, history: list[dict], conv: dict
+    ) -> str:
+        """
+        构建增强上下文段落，注入到 prompt 中。
+
+        包含:
+          - 最近 3 轮对话历史（任务 + 回复摘要）
+          - 本对话中被修改的文件列表
+          - 上一轮审查意见摘要
+          - 谁最后做了什么（叙事性描述）
+        """
+        parts: list[str] = ["[协作上下文]"]
+
+        # ---- 1) 最近 3 轮对话历史 ----
+        recent = history[-3:] if len(history) > 3 else history
+        if recent:
+            parts.append("")
+            parts.append("── 最近协作记录 ──")
+            for i, turn in enumerate(recent, 1):
+                f_name = turn["from_member"]
+                t_name = turn["to_member"]
+                task_text = turn["message"][:300]
+                resp_text = turn["response"][:600]
+                if len(turn["response"]) > 600:
+                    resp_text += "...(已截断)"
+
+                auto_tag = " (LLM自主委托)" if turn.get("auto_delegated") else ""
+                parts.append(
+                    f"  第{i}轮: {f_name} → {t_name}{auto_tag}"
+                )
+                parts.append(f"    任务: {task_text}")
+                parts.append(f"    回复摘要: {resp_text}")
+                if turn.get("delegated_to"):
+                    parts.append(f"    → 继续委托给 {turn['delegated_to']}")
+                parts.append("")
+
+        # ---- 2) 被修改的文件列表 ----
+        modified_files = conv.get("modified_files", [])
+        last_modifier = conv.get("last_modified_by")
+        if modified_files:
+            who = last_modifier or "某位成员"
+            parts.append(f"── {who} 在本次协作中修改了以下文件 ──")
+            for f in modified_files:
+                parts.append(f"  - {f}")
+            parts.append("")
+
+        # ---- 3) 上一轮审查意见 ----
+        last_reviewer = conv.get("last_review_by")
+        last_review = conv.get("last_review_summary")
+        if last_reviewer and last_review and last_reviewer != member_name:
+            review_preview = last_review[:400]
+            if len(last_review) > 400:
+                review_preview += "..."
+            parts.append(
+                f"── {last_reviewer} 的上一轮审查意见（供参考） ──"
+            )
+            parts.append(review_preview)
+            parts.append("")
+
+        # ---- 4) 叙事性上下文摘要 ----
+        context_narratives: list[str] = []
+        if last_modifier and last_modifier != member_name:
+            context_narratives.append(
+                f"{last_modifier} 刚刚完成了代码修改"
+            )
+        if last_reviewer and last_reviewer != member_name:
+            context_narratives.append(
+                f"{last_reviewer} 刚刚完成了代码审查"
+            )
+        if context_narratives:
+            parts.append(
+                "当前状况: " + "，".join(context_narratives) + "。"
+            )
+            parts.append("")
+
+        # 如果只有标题行，说明没有实际内容
+        if len(parts) <= 1:
+            return ""
+
+        return "\n".join(parts)
 
     # ===================================================================
     # 调用 claudecode 执行器
@@ -1013,7 +1053,7 @@ class StudioPlugin(Star):
         ]
 
         for i, turn in enumerate(turns, 1):
-            auto_tag = " (自动委托)" if turn.get("auto_delegated") else ""
+            auto_tag = " (LLM自主委托)" if turn.get("auto_delegated") else ""
             parts.append(f"第{i}轮 - {turn['to_member']}{auto_tag}:")
             parts.append(f"  任务: {turn['message'][:300]}")
             parts.append(f"  回复: {turn['response'][:1000]}")
@@ -1035,7 +1075,7 @@ class StudioPlugin(Star):
         return raw_final
 
     # ===================================================================
-    # Prompt 构建（含上下文注入）
+    # Prompt 构建（增强上下文 + LLM 委托指令）
     # ===================================================================
 
     def _build_prompt(
@@ -1049,9 +1089,11 @@ class StudioPlugin(Star):
         """
         构建 SubAgent 的任务提示词。
 
-        结构: [角色设定] + [上下文提示] + [协作历史] + [当前任务] + [行为指引]
+        结构: [角色设定] + [协作上下文] + [当前任务] + [行为指引]
 
-        conv 参数用于注入上下文记忆（last_modified_by / last_review_by）。
+        核心改进:
+        - 增强上下文注入（最近 3 轮、文件变更、审查意见）
+        - LLM 自主委托指令（【委托给X】/ 【无需委托，任务完成】）
         """
         parts: list[str] = []
 
@@ -1063,80 +1105,59 @@ class StudioPlugin(Star):
         )
         parts.append("")
 
-        # ---- 上下文注入（基于对话记忆） ----
-        if conv and history:
-            last_modified = conv.get("last_modified_by")
-            last_review = conv.get("last_review_by")
-            last_action = conv.get("last_action_type")
-
-            if last_modified and last_modified != member_name:
-                # 当前成员是审查者，告诉TA谁刚修改了代码
-                parts.append(
-                    f"[上下文提示]\n"
-                    f"{last_modified} 刚刚完成了代码修改，"
-                    f"请重点审查上述变更，检查潜在问题。"
-                )
-                parts.append("")
-            elif last_review and last_review != member_name:
-                # 当前成员是实现者，告诉TA谁审查了代码
-                parts.append(
-                    f"[上下文提示]\n"
-                    f"{last_review} 刚刚完成了代码审查，"
-                    f"请根据上述审查意见进行针对性修改。"
-                )
-                parts.append("")
-
-        # ---- 协作历史 ----
-        if history:
-            parts.append("[之前的协作记录]")
-            for turn in history:
-                f_name = turn["from_member"]
-                t_name = turn["to_member"]
-                task_prev = turn["message"][:200]
-                resp_prev = turn["response"][:500]
-                if len(turn["response"]) > 500:
-                    resp_prev += "..."
-
-                auto_tag = " (自动)" if turn.get("auto_delegated") else ""
-                parts.append(
-                    f"  {t_name} (来自 {f_name}){auto_tag}: {task_prev}"
-                )
-                parts.append(f"    回复摘要: {resp_prev}")
-                if turn.get("delegated_to"):
-                    parts.append(
-                        f"    → 委托给 {turn['delegated_to']}"
-                    )
-            parts.append("")
+        # ---- 增强上下文注入 ----
+        if conv and (history or conv.get("modified_files")):
+            context = self._build_rich_context(member_name, history, conv)
+            if context:
+                parts.append(context)
 
         # ---- 当前任务 ----
         parts.append(f"[当前任务]\n{task}")
         parts.append("")
 
-        # ---- 行为指引 ----
+        # ---- 行为指引（含 LLM 委托指令） ----
         all_members = list(self.studio_members.keys())
         others = [n for n in all_members if n != member_name]
-        delegate_hint = ""
-        if others:
+        llm_delegate_enabled = self.config.get("llm_delegate", True)
+
+        guidance_lines: list[str] = [
+            "[行为指引]",
+            "1. 完成任务后，直接给出面向主人的最终回复。",
+            "2. 保持人格风格一致。",
+        ]
+
+        if llm_delegate_enabled and others:
+            # LLM 自主委托模式
+            guidance_lines.append(
+                "3. 关于是否需要其他成员继续处理："
+            )
+            for other in others:
+                guidance_lines.append(
+                    f"   - 如果你认为需要让 {other} 继续处理，"
+                    f"在回复最末尾写：【委托给{other}】<具体要求>"
+                )
+            guidance_lines.append(
+                "   - 如果你认为任务已完成，不需要委托，"
+                "在回复最末尾写：【无需委托，任务完成】"
+            )
+            guidance_lines.append(
+                "4. 如果回复中没有以上任何标记，系统将视为任务完成。"
+            )
+            guidance_lines.append(
+                "5. 请务必根据任务实际情况自主判断，"
+                "不要机械地委托。只有确实需要对方继续处理时才委托。"
+            )
+        elif others:
+            # 仅支持显式 @mention 委托
             others_str = " / ".join(f"@{n}" for n in others)
-            delegate_hint = (
-                f"\n3. 如需其他成员协助，在回复末尾写「{others_str} 具体要求」。"
+            guidance_lines.append(
+                f"3. 如需其他成员协助，在回复末尾写「{others_str} 具体要求」。"
+            )
+            guidance_lines.append(
+                "4. 如果不需要委托，回复中不要包含任何 @。"
             )
 
-        auto_delegate_note = ""
-        if self.config.get("auto_delegate", True) and others:
-            auto_delegate_note = (
-                "\n4. 如果你不需要其他成员协助，直接给出最终回复即可，"
-                "系统会自动将结果转发给其他成员。"
-            )
-
-        parts.append(
-            "[行为指引]\n"
-            "1. 完成任务后，直接给出面向主人的最终回复。\n"
-            "2. 保持人格风格一致。"
-            f"{delegate_hint}\n"
-            "3. 如果不需要委托，回复中不要包含任何 @。"
-            f"{auto_delegate_note}"
-        )
+        parts.append("\n".join(guidance_lines))
 
         return "\n".join(parts)
 
@@ -1169,7 +1190,7 @@ class StudioPlugin(Star):
         return None
 
     # ===================================================================
-    # 委托检测
+    # 委托检测（显式 @mention）
     # ===================================================================
 
     def _detect_delegation(self, text: str) -> Optional[tuple[str, str]]:
@@ -1215,10 +1236,11 @@ class StudioPlugin(Star):
                 "created_at": time.time(),
                 "updated_at": time.time(),
                 # ---- 上下文记忆 ----
-                "last_modified_by": None,   # 最近一次修改代码的成员
-                "last_review_by": None,     # 最近一次审查代码的成员
-                "last_action_type": None,   # 最近一次动作类型: "modification" / "review"
-                "auto_delegate_count": 0,   # 本轮自动委托次数
+                "last_modified_by": None,       # 最近一次修改代码的成员
+                "last_review_by": None,         # 最近一次审查代码的成员
+                "modified_files": [],           # 本对话中被修改的文件列表
+                "last_review_summary": None,    # 上一轮审查意见摘要
+                "auto_delegate_count": 0,       # 本轮 LLM 自主委托次数
             }
         return self.conversations[session_id]
 
@@ -1277,19 +1299,19 @@ class StudioPlugin(Star):
         initial = conv.get("initial_member", "?")
         parts: list[str] = []
 
-        # 统计自动委托次数
+        # 统计 LLM 自主委托次数
         auto_count = sum(1 for t in turns if t.get("auto_delegated"))
 
         if len(turns) > 1:
             chain = " → ".join(t["to_member"] for t in turns)
-            auto_info = f" (含 {auto_count} 次自动委托)" if auto_count else ""
+            auto_info = f" (含 {auto_count} 次 LLM 自主委托)" if auto_count else ""
             parts.append(
                 f"协作完成 | 发起: {initial} | "
                 f"链路: {chain} | "
-                f"{len(turns)} 轮{auto_info} | 耗时 {elapsed:.1}s"
+                f"{len(turns)} 轮{auto_info} | 耗时 {elapsed:.1f}s"
             )
         else:
-            parts.append(f"🤖 {initial} | 耗时 {elapsed:.1}s")
+            parts.append(f"🤖 {initial} | 耗时 {elapsed:.1f}s")
 
         if len(turns) > 1:
             parts.extend(["", "── 协作过程 ──"])
@@ -1297,7 +1319,7 @@ class StudioPlugin(Star):
                 preview = turn["response"][:200]
                 if len(turn["response"]) > 200:
                     preview += "..."
-                auto_tag = " 🔄自动" if turn.get("auto_delegated") else ""
+                auto_tag = " 🔄LLM自主" if turn.get("auto_delegated") else ""
                 parts.append(f"  [{i}] {turn['to_member']}{auto_tag}: {preview}")
                 if turn.get("delegated_to"):
                     parts.append(
@@ -1315,13 +1337,16 @@ class StudioPlugin(Star):
         # 上下文记忆摘要
         last_mod = conv.get("last_modified_by")
         last_rev = conv.get("last_review_by")
-        if last_mod or last_rev:
-            context_parts = []
+        modified_files = conv.get("modified_files", [])
+        if last_mod or last_rev or modified_files:
+            ctx_parts = []
             if last_mod:
-                context_parts.append(f"最近修改: {last_mod}")
+                ctx_parts.append(f"最近修改: {last_mod}")
             if last_rev:
-                context_parts.append(f"最近审查: {last_rev}")
-            parts.append(f"\n📋 上下文: {' | '.join(context_parts)}")
+                ctx_parts.append(f"最近审查: {last_rev}")
+            if modified_files:
+                ctx_parts.append(f"涉及文件: {len(modified_files)} 个")
+            parts.append(f"\n📋 上下文: {' | '.join(ctx_parts)}")
 
         return "\n".join(parts)
 
@@ -1362,18 +1387,21 @@ class StudioPlugin(Star):
         # 上下文记忆
         last_mod = conv.get("last_modified_by")
         last_rev = conv.get("last_review_by")
-        if last_mod or last_rev:
+        modified_files = conv.get("modified_files", [])
+        if last_mod or last_rev or modified_files:
             ctx = []
             if last_mod:
                 ctx.append(f"最近修改: {last_mod}")
             if last_rev:
                 ctx.append(f"最近审查: {last_rev}")
+            if modified_files:
+                ctx.append(f"修改文件: {len(modified_files)} 个")
             lines.append(f"  上下文: {' | '.join(ctx)}")
 
         lines.append("")
 
         for i, turn in enumerate(conv["turns"], 1):
-            auto_tag = " 🔄自动" if turn.get("auto_delegated") else ""
+            auto_tag = " 🔄LLM自主" if turn.get("auto_delegated") else ""
             lines.append(
                 f"[{i}] {turn['to_member']}{auto_tag} "
                 f"(来自 {turn['from_member']})"
@@ -1400,8 +1428,8 @@ class StudioPlugin(Star):
         auto_stop = (
             "✅ 开启" if self.config.get("auto_stop_on_complete", True) else "❌ 关闭"
         )
-        auto_delegate = (
-            "✅ 开启" if self.config.get("auto_delegate", True) else "❌ 关闭"
+        llm_delegate = (
+            "✅ 开启" if self.config.get("llm_delegate", True) else "❌ 关闭"
         )
 
         lines = [
@@ -1409,7 +1437,7 @@ class StudioPlugin(Star):
             "",
             f"  执行引擎:     {'✅ claudecode 已连接' if executor_ok else '❌ 未连接'}",
             f"  智能停止:      {auto_stop}",
-            f"  自动委托:      {auto_delegate}",
+            f"  LLM 自主委托:  {llm_delegate}",
             f"  委托轮次上限:  {max_rounds}",
             f"  成员数:       {n_members}/{max_members}",
             f"  协作会话:     {active} 活跃 / {total} 总计",
@@ -1461,11 +1489,18 @@ class StudioPlugin(Star):
             "  成员之间也可以 @对方 进行内部委托。\n"
             "  默认最多 10 轮（可配置），避免死循环。\n"
             "\n"
-            "自动委托:\n"
-            "  开启后，成员完成任务会自动转发给搭档。\n"
-            "  编码完成 → 自动 @审查者 审查代码\n"
-            "  审查完成 → 自动 @实现者 根据意见修改\n"
-            "  形成「编码→审查→修改→再审查」的闭环。\n"
+            "LLM 自主委托:\n"
+            "  每个成员完成任务后，LLM 会自主判断是否\n"
+            "  需要委托给其他成员继续处理。\n"
+            "  通过【委托给X】或【无需委托，任务完成】标记指示。\n"
+            "  LLM 会根据实际情况决定，不会机械委托。\n"
+            "\n"
+            "上下文记忆:\n"
+            "  系统自动维护协作上下文，包括：\n"
+            "  - 最近 3 轮对话记录\n"
+            "  - 被修改的文件列表\n"
+            "  - 上一轮审查意见\n"
+            "  确保每个成员都了解之前发生了什么。\n"
             "\n"
             "示例:\n"
             "  /studio add 架构师 你擅长系统设计和架构评审\n"
