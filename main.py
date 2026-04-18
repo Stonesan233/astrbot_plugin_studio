@@ -388,11 +388,13 @@ class StudioPlugin(Star):
     # ===================================================================
 
     def _handle_add(self, args_str: str) -> str:
-        """添加成员: /studio add <名称> <人格提示词>"""
+        """添加成员: /studio add <名称> <人格提示词>
+        也支持绑定 SubAgent: 由 API 传入 subagent_id + public_description"""
         if not args_str:
             return (
                 "用法: /studio add <名称> <人格提示词>\n"
-                "示例: /studio add 架构师 你擅长系统设计和架构评审"
+                "示例: /studio add 架构师 你擅长系统设计和架构评审\n"
+                "也可通过 Dashboard 绑定已有 SubAgent"
             )
 
         parts = args_str.split(maxsplit=1)
@@ -408,6 +410,25 @@ class StudioPlugin(Star):
         if not name or not persona_prompt:
             return "名称和人格提示词不能为空"
 
+        return self._add_member_internal(name, persona_prompt)
+
+    def _handle_bind_subagent(
+        self, name: str, persona_prompt: str, subagent_name: str = "", description: str = ""
+    ) -> str:
+        """绑定已有 SubAgent 作为工作室成员"""
+        if not name:
+            return "SubAgent 名称不能为空"
+
+        persona_prompt = persona_prompt or description or f"AstrBot SubAgent: {name}"
+
+        return self._add_member_internal(
+            name, persona_prompt, bound_subagent=subagent_name or name
+        )
+
+    def _add_member_internal(
+        self, name: str, persona_prompt: str, bound_subagent: str = ""
+    ) -> str:
+        """内部添加成员逻辑"""
         max_members = self.config.get("max_members", 10)
         if len(self.studio_members) >= max_members:
             return (
@@ -424,6 +445,7 @@ class StudioPlugin(Star):
             "name": name,
             "subagent_id": subagent_id,
             "persona_prompt": persona_prompt,
+            "bound_subagent": bound_subagent,
             "emoji": "🤖",
             "created_at": time.time(),
         }
@@ -434,6 +456,7 @@ class StudioPlugin(Star):
         logger.info(
             f"[{PLUGIN_NAME}] 添加成员: {name} | "
             f"subagent_id={subagent_id} | "
+            f"bound_subagent={bound_subagent} | "
             f"提示词={persona_prompt[:60]}"
         )
         return (
