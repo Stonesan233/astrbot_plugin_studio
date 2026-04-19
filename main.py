@@ -256,7 +256,23 @@ class StudioPlugin(Star):
                     logger.debug(f"[{PLUGIN_NAME}] 读取 claude 插件配置失败: {e}")
 
             project_root = self.config.get("project_root", "").strip()
-            workspace = Path(project_root) if project_root else PLUGIN_DIR / "workspace"
+
+            # 优先复用 claude 插件已配置好的 workspace（包含 settings.json）
+            workspace = None
+            if not project_root:
+                for candidate in [
+                    "astrbot_plugin_claude_code_custom",
+                    "astrbot_plugin_claudecode",
+                ]:
+                    candidate_ws = PLUGIN_DIR.parent.parent / "plugin_data" / candidate / "workspace"
+                    if (candidate_ws / ".claude" / "settings.json").exists():
+                        workspace = candidate_ws
+                        logger.info(
+                            f"[{PLUGIN_NAME}] 复用 claude 插件 workspace: {workspace}"
+                        )
+                        break
+            if not workspace:
+                workspace = Path(project_root) if project_root else PLUGIN_DIR / "workspace"
             workspace.mkdir(parents=True, exist_ok=True)
 
             if skip_permissions:
