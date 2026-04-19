@@ -122,10 +122,13 @@ class StudioPlugin(Star):
             self._load_members()
 
         llm_delegate = "开启" if self.config.get("llm_delegate", True) else "关闭"
+        orchestrator = getattr(self.context, "subagent_orchestrator", None)
+        n_subagents = len(orchestrator.handoffs) if orchestrator else 0
         logger.info(
             f"[{PLUGIN_NAME}] 工作室插件已加载，"
             f"当前 {len(self.studio_members)} 位成员 | "
             f"executor={'✅' if self._executor else '❌'} | "
+            f"SubAgent 编排器: {n_subagents} 个 | "
             f"LLM 自主委托: {llm_delegate}"
         )
 
@@ -428,18 +431,41 @@ class StudioPlugin(Star):
     def _handle_bind_subagent(
         self, name: str, persona_prompt: str, subagent_name: str = "", description: str = ""
     ) -> str:
-        """绑定已有 SubAgent 作为工作室成员"""
+        """绑定已有 SubAgent 作为工作室成员（真正绑定原 SubAgent 实例）"""
         if not name:
             return "SubAgent 名称不能为空"
 
-        persona_prompt = persona_prompt or description or f"AstrBot SubAgent: {name}"
+        target_sa = subagent_name or name
+
+        # 验证 SubAgent 是否存在于 orchestrator
+        handoff = self._find_handoff(target_sa)
+        if not handoff:
+            return (
+                f"SubAgent「{target_sa}」未在 AstrBot 中注册或未启用。\n"
+                "请先在 SubAgent 管理页创建并启用该 SubAgent。"
+            )
+
+        # 优先使用 SubAgent 的 instructions 作为人格
+        if not persona_prompt and not description:
+            persona_prompt = handoff.agent.instructions or f"AstrBot SubAgent: {target_sa}"
+        elif not persona_prompt:
+            persona_prompt = description or f"AstrBot SubAgent: {target_sa}"
+
+        provider_id = handoff.provider_id or ""
 
         return self._add_member_internal(
-            name, persona_prompt, bound_subagent=subagent_name or name
+            name,
+            persona_prompt,
+            bound_subagent=target_sa,
+            provider_id=provider_id,
         )
 
     def _add_member_internal(
-        self, name: str, persona_prompt: str, bound_subagent: str = ""
+        self,
+        name: str,
+        persona_prompt: str,
+        bound_subagent: str = "",
+        provider_id: str = "",
     ) -> str:
         """内部添加成员逻辑"""
         max_members = self.config.get("max_members", 10)
@@ -454,27 +480,37 @@ class StudioPlugin(Star):
 
         subagent_id = f"studio_{name.lower().replace(' ', '_')}_{int(time.time())}"
 
-        self.studio_members[name] = {
+        member_data = {
             "name": name,
             "subagent_id": subagent_id,
             "persona_prompt": persona_prompt,
             "bound_subagent": bound_subagent,
+            "provider_id": provider_id,
             "emoji": "🤖",
             "created_at": time.time(),
         }
 
+        self.studio_members[name] = member_data
+
         if self.config.get("persist_members", True):
             self._save_members()
+
+        bind_info = ""
+        if bound_subagent:
+            bind_info = f"\n   绑定 SubAgent: {bound_subagent}"
+            if provider_id:
+                bind_info += f" (provider: {provider_id})"
 
         logger.info(
             f"[{PLUGIN_NAME}] 添加成员: {name} | "
             f"subagent_id={subagent_id} | "
             f"bound_subagent={bound_subagent} | "
+            f"provider_id={provider_id} | "
             f"提示词={persona_prompt[:60]}"
         )
         return (
             f"✅ 已添加成员「{name}」\n"
-            f"   subagent_id: {subagent_id}\n"
+            f"   subagent_id: {subagent_id}{bind_info}\n"
             f"   人格: {persona_prompt[:200]}\n"
             f"   当前共 {len(self.studio_members)}/{max_members} 位成员"
         )
@@ -518,9 +554,14 @@ class StudioPlugin(Star):
             "%Y-%m-%d %H:%M",
             time.localtime(member.get("created_at", 0)),
         )
+        bind_info = ""
+        if member.get("bound_subagent"):
+            bind_info = f"\n绑定 SubAgent: {member['bound_subagent']}"
+            if member.get("provider_id"):
+                bind_info += f"\nProvider: {member['provider_id']}"
         return (
             f"成员: {member.get('emoji', '🤖')} {member['name']}\n"
-            f"subagent_id: {member.get('subagent_id', '无')}\n"
+            f"subagent_id: {member.get('subagent_id', '无')}{bind_info}\n"
             f"创建时间: {created}\n"
             f"人格设定:\n{member['persona_prompt']}"
         )
@@ -538,10 +579,113 @@ class StudioPlugin(Star):
             emoji = info.get("emoji", "🤖")
             prompt = info["persona_prompt"]
             preview = prompt[:60] + "..." if len(prompt) > 60 else prompt
-            lines.append(f"  {i}. {emoji} {name}")
+            bind_tag = ""
+            if info.get("bound_subagent"):
+                bind_tag = f" [SubAgent: {info['bound_subagent']}]"
+                if info.get("provider_id"):
+                    bind_tag += f" ({info['provider_id']})"
+            lines.append(f"  {i}. {emoji} {name}{bind_tag}")
             lines.append(f"     {preview}")
 
         return "\n".join(lines)
+
+    # ===================================================================
+    # SubAgent 原生绑定与执行
+    # ===================================================================
+
+    def _find_handoff(self, subagent_name: str):
+        """
+        从 SubAgentOrchestrator 中按名称查找 HandoffTool。
+        返回 HandoffTool 实例或 None。
+        """
+        orchestrator = getattr(self.context, "subagent_orchestrator", None)
+        if not orchestrator:
+            return None
+        for h in orchestrator.handoffs:
+            if h.agent.name == subagent_name:
+                return h
+        return None
+
+    async def _call_subagent(
+        self, member: dict, prompt: str, event: AstrMessageEvent
+    ) -> str:
+        """
+        通过 AstrBot 原生 SubAgent 执行方式（tool_loop_agent）运行任务。
+        使用原 SubAgent 的 LLM 配置（provider_id）、tools、system_prompt。
+
+        Returns:
+            执行结果文本
+        """
+        bound_name = member.get("bound_subagent", "")
+        if not bound_name:
+            raise RuntimeError(f"成员「{member['name']}」未绑定 SubAgent")
+
+        handoff = self._find_handoff(bound_name)
+        if not handoff:
+            raise RuntimeError(
+                f"绑定 SubAgent「{bound_name}」未找到，可能已被删除或禁用"
+            )
+
+        # 解析 provider_id
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        if handoff.provider_id:
+            provider_id = handoff.provider_id
+        else:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(umo)
+            except Exception:
+                provider_id = ""
+
+        if not provider_id:
+            raise RuntimeError("无法确定 LLM Provider，请检查配置")
+
+        # 构建 tools
+        tool_mgr = self.context.get_llm_tool_manager()
+        from astrbot.core.agent.tool import ToolSet
+        from astrbot.core.agent.handoff import HandoffTool
+
+        agent_tools = handoff.agent.tools
+        toolset = None
+
+        if agent_tools is None:
+            # None = 所有已注册工具（排除 handoff 工具）
+            toolset = ToolSet()
+            for t in tool_mgr.func_list:
+                if isinstance(t, HandoffTool):
+                    continue
+                if t.active:
+                    toolset.add_tool(t)
+            if toolset.empty():
+                toolset = None
+        elif agent_tools:
+            toolset = ToolSet()
+            for tool_name in agent_tools:
+                for t in tool_mgr.func_list:
+                    if t.name == tool_name and t.active:
+                        toolset.add_tool(t)
+                        break
+            if toolset.empty():
+                toolset = None
+
+        # 使用 SubAgent 的 system_prompt
+        system_prompt = handoff.agent.instructions or member.get("persona_prompt", "")
+
+        # 调用 AstrBot 原生 tool_loop_agent
+        cfg = self.context.get_config(umo=umo)
+        prov_settings: dict = cfg.get("provider_settings", {}) if cfg else {}
+        max_steps = int(prov_settings.get("max_agent_step", 30))
+
+        llm_resp = await self.context.tool_loop_agent(
+            event=event,
+            chat_provider_id=provider_id,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            tools=toolset,
+            max_steps=max_steps,
+            stream=False,
+        )
+
+        return llm_resp.completion_text or ""
 
     # ===================================================================
     # 工作室协作入口
@@ -730,8 +874,27 @@ class StudioPlugin(Star):
                     current_member, member, current_task, current_turns, conv
                 )
 
-                # ---- 2) 调用 claudecode 执行器 ----
-                response = await self._call_executor(prompt)
+                # ---- 2) 调用执行器 ----
+                bound_subagent = member.get("bound_subagent", "")
+                if bound_subagent and self._find_handoff(bound_subagent):
+                    # 优先走原生 SubAgent 执行
+                    try:
+                        response = await self._call_subagent(
+                            member, prompt, event
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] 原生 SubAgent 执行失败: {e}，"
+                            "回退到 claudecode 执行器"
+                        )
+                        if not self._executor:
+                            return f"原生 SubAgent 和 claudecode 执行器均不可用: {e}"
+                        response = await self._call_executor(prompt)
+                elif self._executor:
+                    response = await self._call_executor(prompt)
+                else:
+                    conv["status"] = "error"
+                    return "执行引擎未就绪，无法执行任务。"
 
                 # ---- 3) 解析委托标记（在 strip 之前） ----
                 # 优先级: 显式 @mention > LLM 【委托给...】标记
