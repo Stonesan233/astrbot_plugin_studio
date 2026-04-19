@@ -242,7 +242,7 @@ class StudioPlugin(Star):
                     ]:
                         config_json = claude_cfg_dir.parent / "config" / f"{candidate}_config.json"
                         if config_json.exists():
-                            saved = json.loads(config_json.read_text(encoding="utf-8"))
+                            saved = json.loads(config_json.read_text(encoding="utf-8-sig"))
                             if not api_key:
                                 api_key = saved.get("api_key", api_key)
                             if not base_url:
@@ -252,8 +252,8 @@ class StudioPlugin(Star):
                             if not skip_permissions:
                                 skip_permissions = saved.get("dangerously_skip_permissions", False)
                             break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[{PLUGIN_NAME}] 读取 claude 插件配置失败: {e}")
 
             project_root = self.config.get("project_root", "").strip()
             workspace = Path(project_root) if project_root else PLUGIN_DIR / "workspace"
