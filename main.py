@@ -275,10 +275,7 @@ class StudioPlugin(Star):
                 workspace = Path(project_root) if project_root else PLUGIN_DIR / "workspace"
             workspace.mkdir(parents=True, exist_ok=True)
 
-            if skip_permissions:
-                permission_mode = None
-            else:
-                permission_mode = "dontAsk"
+            permission_mode = "dontAsk"
 
             cfg = ClaudeConfig(
                 auth_token="",
